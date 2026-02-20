@@ -1,18 +1,35 @@
+from __future__ import annotations
+
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import get_current_user
-from app.schemas.plans import PlanDropdownOut
-from app.services.seller_plans import list_available_plans_for_seller
+from app.core.deps import require_seller
+from app.models.plan import Plan
+from app.models.seller_plan_price import SellerPlanPrice
+from app.models.user import User
+from app.schemas.plans import PlanOut
 
-router = APIRouter(prefix="/sellers/plans", tags=["Seller Plans"])
+router = APIRouter(prefix="/sellers/plans", tags=["Seller - Plans"])
 
 
-@router.get("/available", response_model=list[PlanDropdownOut])
+@router.get("/available", response_model=list[PlanOut])
 async def get_available_plans(
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    seller_user: User = Depends(require_seller),
 ):
-    items = await list_available_plans_for_seller(db, seller_user_id=current_user.id)
-    return items
+    """
+    Seller can only see plans that are assigned to them via seller_plan_prices.
+    If no plans assigned => empty list.
+    """
+    stmt = (
+        select(Plan)
+        .join(SellerPlanPrice, SellerPlanPrice.plan_id == Plan.id)
+        .where(SellerPlanPrice.seller_id == int(seller_user.id))
+        .where(Plan.is_active.is_(True))
+        .order_by(Plan.category.asc(), Plan.title.asc())
+    )
+
+    res = await db.execute(stmt)
+    return res.scalars().all()

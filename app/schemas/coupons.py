@@ -46,6 +46,7 @@ class AdminCouponUnreserveRequest(BaseModel):
 class AdminCouponVoidRequest(BaseModel):
     reason: str | None = None
 
+
 class AdminCouponPlanOut(BaseModel):
     plan_id: int
     plan_code: str
@@ -54,6 +55,8 @@ class AdminCouponPlanOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
 class AdminCouponReserveRequest(BaseModel):
     udid: str
     notes: str | None = None
@@ -62,3 +65,11 @@ class AdminCouponReserveRequest(BaseModel):
 class AdminCouponFailRequest(BaseModel):
     reason: str
     step: str | None = None
+
+
+class SellerCouponGenerateRequest(BaseModel):
+    plan_id: int
+    count: int = Field(1, ge=1, le=500)
+    # Optional: generate under a DIRECT child (never grandchildren)
+    owner_user_id: int | None = None
+    notes: str | None = None

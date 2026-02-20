@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, desc, func, select
+from sqlalchemy import Integer, String, case, cast, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.order import Order
 from app.models.plan import Plan
@@ -104,6 +105,14 @@ def _resolve_period(period: str, date_from: datetime | None, date_to: datetime |
     return _Range(period="today", date_from=_to_utc_naive(date_from_aware_utc), date_to=_to_utc_naive(date_to_aware_utc))
 
 
+def _apply_time_filter(stmt, dt_col, r: _Range):
+    if r.date_from is not None:
+        stmt = stmt.where(dt_col >= r.date_from)
+    if r.date_to is not None:
+        stmt = stmt.where(dt_col <= r.date_to)
+    return stmt
+
+
 async def _username_map(db: AsyncSession, user_ids: list[int]) -> dict[int, str]:
     ids = [int(x) for x in set(user_ids) if x is not None]
     if not ids:
@@ -114,24 +123,263 @@ async def _username_map(db: AsyncSession, user_ids: list[int]) -> dict[int, str]
 
 async def _direct_scope_user_ids(db: AsyncSession, *, current_user_id: int) -> list[int]:
     """
-    Direct scope for seller dashboard: self + direct children only.
+    Direct scope for seller pages where structure must not expose grandchildren:
+    self + direct children only.
     """
     res = await db.execute(select(User.id).where(User.parent_id == current_user_id))
     child_ids = [int(x) for x in res.scalars().all()]
     return [int(current_user_id)] + child_ids
 
 
-def _apply_time_filter(stmt, col, r: _Range):
-    if r.date_from is not None:
-        stmt = stmt.where(col >= r.date_from)
-    if r.date_to is not None:
-        stmt = stmt.where(col <= r.date_to)
-    return stmt
+def _ltree_is_descendant_expr(user_path_col, ancestor_path: str):
+    # ltree operator: child_path <@ ancestor_path
+    return user_path_col.op("<@")(ancestor_path)
 
 
-# -------------------------
-# SALES (orders-based)
-# -------------------------
+def _direct_child_bucket_user_id_expr(*, buyer_id_col, buyer_path_col, current_user_id: int, current_user_path: str):
+    """
+    For any buyer in current user's subtree, compute the "bucket" user_id:
+      - If buyer == current user => bucket = current user
+      - Else bucket = the direct child of current_user that is an ancestor of buyer
+        (derived from buyer.path using ltree subpath / nlevel)
+
+    This supports rollups from grandchildren WITHOUT revealing them.
+    """
+    # Extract one label after current_user_path: "u<id>"
+    child_label_ltree = func.subpath(buyer_path_col, func.nlevel(current_user_path), 1)
+    child_label_txt = cast(child_label_ltree, String)
+    child_id_txt = func.substr(child_label_txt, 2)  # strip leading "u"
+    child_id_int = cast(child_id_txt, Integer)
+
+    return case(
+        (buyer_id_col == int(current_user_id), int(current_user_id)),
+        else_=child_id_int,
+    )
+
+
+async def sales_totals_subtree(
+    db: AsyncSession,
+    *,
+    current_user_path: str,
+    period: str,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> dict:
+    """
+    Seller rollup totals: include purchases made by ANY descendant (direct + indirect).
+    """
+    r = _resolve_period(period, date_from, date_to)
+
+    Buyer = aliased(User)
+
+    stmt = (
+        select(
+            func.coalesce(func.sum(Order.total_paid_cents), 0).label("sales_cents"),
+            func.coalesce(func.count(Order.id), 0).label("orders_count"),
+            func.coalesce(func.sum(Order.quantity), 0).label("units"),
+        )
+        .select_from(Order)
+        .join(Buyer, Buyer.id == Order.buyer_user_id)
+        .where(_ltree_is_descendant_expr(Buyer.path, current_user_path))
+    )
+
+    stmt = _apply_time_filter(stmt, Order.created_at, r)
+
+    res = await db.execute(stmt)
+    row = res.first() or (0, 0, 0)
+
+    return {
+        "period": r.period,
+        "date_from": r.date_from,
+        "date_to": r.date_to,
+        "total_sales_cents": int(row[0] or 0),
+        "total_orders": int(row[1] or 0),
+        "total_units": int(row[2] or 0),
+    }
+
+
+async def sales_by_plan_subtree(
+    db: AsyncSession,
+    *,
+    current_user_path: str,
+    period: str,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    limit: int = 50,
+) -> dict:
+    """
+    Seller rollup: group by plan using purchases made by ANY descendant.
+    """
+    r = _resolve_period(period, date_from, date_to)
+
+    Buyer = aliased(User)
+
+    stmt = (
+        select(
+            Plan.id.label("plan_id"),
+            Plan.title.label("plan_title"),
+            Plan.category.label("plan_category"),
+            func.coalesce(func.sum(Order.total_paid_cents), 0).label("sales_cents"),
+            func.coalesce(func.count(Order.id), 0).label("orders_count"),
+            func.coalesce(func.sum(Order.quantity), 0).label("units"),
+        )
+        .select_from(Order)
+        .join(Plan, Plan.id == Order.plan_id)
+        .join(Buyer, Buyer.id == Order.buyer_user_id)
+        .where(_ltree_is_descendant_expr(Buyer.path, current_user_path))
+        .group_by(Plan.id, Plan.title, Plan.category)
+        .order_by(desc("sales_cents"))
+        .limit(int(limit))
+    )
+
+    stmt = _apply_time_filter(stmt, Order.created_at, r)
+
+    res = await db.execute(stmt)
+    items = []
+    for row in res.all():
+        items.append(
+            {
+                "plan_id": int(row.plan_id),
+                "plan_title": row.plan_title or "",
+                "plan_category": row.plan_category or "",
+                "sales_cents": int(row.sales_cents or 0),
+                "orders_count": int(row.orders_count or 0),
+                "units": int(row.units or 0),
+            }
+        )
+
+    return {"period": r.period, "date_from": r.date_from, "date_to": r.date_to, "items": items}
+
+
+async def sales_by_seller_rollup_direct(
+    db: AsyncSession,
+    *,
+    current_user_id: int,
+    current_user_path: str,
+    period: str,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    limit: int = 50,
+) -> dict:
+    """
+    Seller rollup: group ALL descendant purchases under (self + direct children) buckets.
+    This includes grandchildren but does not reveal them.
+    """
+    r = _resolve_period(period, date_from, date_to)
+
+    Buyer = aliased(User)
+
+    bucket_user_id = _direct_child_bucket_user_id_expr(
+        buyer_id_col=Buyer.id,
+        buyer_path_col=Buyer.path,
+        current_user_id=int(current_user_id),
+        current_user_path=str(current_user_path),
+    ).label("bucket_user_id")
+
+    stmt = (
+        select(
+            bucket_user_id,
+            func.coalesce(func.sum(Order.total_paid_cents), 0).label("sales_cents"),
+            func.coalesce(func.count(Order.id), 0).label("orders_count"),
+            func.coalesce(func.sum(Order.quantity), 0).label("units"),
+        )
+        .select_from(Order)
+        .join(Buyer, Buyer.id == Order.buyer_user_id)
+        .where(_ltree_is_descendant_expr(Buyer.path, current_user_path))
+        .group_by(bucket_user_id)
+        .order_by(desc("sales_cents"))
+        .limit(int(limit))
+    )
+
+    stmt = _apply_time_filter(stmt, Order.created_at, r)
+
+    res = await db.execute(stmt)
+    rows = res.all()
+
+    bucket_ids = [int(r[0]) for r in rows if r[0] is not None]
+    uname = await _username_map(db, bucket_ids)
+
+    items = []
+    for row in rows:
+        bid = row[0]
+        if bid is None:
+            continue
+        bid_int = int(bid)
+        items.append(
+            {
+                "user_id": bid_int,
+                "username": uname.get(bid_int, ""),
+                "sales_cents": int(row.sales_cents or 0),
+                "orders_count": int(row.orders_count or 0),
+                "units": int(row.units or 0),
+            }
+        )
+
+    return {"period": r.period, "date_from": r.date_from, "date_to": r.date_to, "items": items}
+
+
+async def dashboard_summary_seller_rollup(
+    db: AsyncSession,
+    *,
+    current_user: User,
+    period: str,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> dict:
+    """
+    Seller dashboard summary (rollup-safe):
+      - Sales/orders/units are rolled up from full subtree (direct + indirect)
+      - "best_seller" is bucketed to self + direct children (grandchildren rolled up)
+      - Profit is ledger-based (self + direct children)
+    """
+    scope_ids = await _direct_scope_user_ids(db, current_user_id=int(current_user.id))
+
+    totals = await sales_totals_subtree(
+        db,
+        current_user_path=str(current_user.path),
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    profit_rows = await profit_by_seller(db, period=period, date_from=date_from, date_to=date_to, user_ids=scope_ids, limit=1000)
+    profit_total = sum(int(x["profit_cents"]) for x in profit_rows["items"])
+
+    plan_rows = await sales_by_plan_subtree(
+        db,
+        current_user_path=str(current_user.path),
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        limit=1,
+    )
+    seller_rows = await sales_by_seller_rollup_direct(
+        db,
+        current_user_id=int(current_user.id),
+        current_user_path=str(current_user.path),
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        limit=1,
+    )
+
+    best_plan = (plan_rows["items"][0] if plan_rows["items"] else {})
+    best_seller = (seller_rows["items"][0] if seller_rows["items"] else {})
+
+    return {
+        "period": totals["period"],
+        "date_from": totals["date_from"],
+        "date_to": totals["date_to"],
+        "total_sales_cents": totals["total_sales_cents"],
+        "total_orders": totals["total_orders"],
+        "total_units": totals["total_units"],
+        "admin_base_cents": 0,
+        "admin_profit_cents": 0,
+        "total_profit_cents": int(profit_total),
+        "best_seller": best_seller or {},
+        "best_plan": best_plan or {},
+    }
+
 
 async def sales_totals(
     db: AsyncSession,
@@ -174,7 +422,7 @@ async def sales_by_plan(
     period: str,
     date_from: datetime | None,
     date_to: datetime | None,
-    buyer_user_ids: list[int] | None = None,
+    buyer_user_ids: list[int] | None,
     limit: int = 50,
 ) -> dict:
     r = _resolve_period(period, date_from, date_to)
@@ -185,36 +433,34 @@ async def sales_by_plan(
 
     stmt = (
         select(
-            Order.plan_id.label("plan_id"),
+            Plan.id.label("plan_id"),
+            Plan.title.label("plan_title"),
+            Plan.category.label("plan_category"),
             func.coalesce(func.sum(Order.total_paid_cents), 0).label("sales_cents"),
             func.coalesce(func.count(Order.id), 0).label("orders_count"),
             func.coalesce(func.sum(Order.quantity), 0).label("units"),
-            Plan.title.label("plan_title"),
-            Plan.category.label("plan_category"),
         )
         .select_from(Order)
         .join(Plan, Plan.id == Order.plan_id)
         .where(*filters)
-        .group_by(Order.plan_id, Plan.title, Plan.category)
+        .group_by(Plan.id, Plan.title, Plan.category)
         .order_by(desc("sales_cents"))
-        .limit(limit)
+        .limit(int(limit))
     )
 
     stmt = _apply_time_filter(stmt, Order.created_at, r)
 
     res = await db.execute(stmt)
-    rows = res.all()
-
     items = []
-    for x in rows:
+    for row in res.all():
         items.append(
             {
-                "plan_id": int(x.plan_id),
-                "plan_title": x.plan_title or "",
-                "plan_category": x.plan_category or "",
-                "sales_cents": int(x.sales_cents or 0),
-                "orders_count": int(x.orders_count or 0),
-                "units": int(x.units or 0),
+                "plan_id": int(row.plan_id),
+                "plan_title": row.plan_title or "",
+                "plan_category": row.plan_category or "",
+                "sales_cents": int(row.sales_cents or 0),
+                "orders_count": int(row.orders_count or 0),
+                "units": int(row.units or 0),
             }
         )
 
@@ -227,7 +473,7 @@ async def sales_by_seller(
     period: str,
     date_from: datetime | None,
     date_to: datetime | None,
-    buyer_user_ids: list[int] | None = None,
+    buyer_user_ids: list[int] | None,
     limit: int = 50,
 ) -> dict:
     r = _resolve_period(period, date_from, date_to)
@@ -238,44 +484,37 @@ async def sales_by_seller(
 
     stmt = (
         select(
-            Order.buyer_user_id.label("user_id"),
+            User.id.label("user_id"),
+            User.username.label("username"),
             func.coalesce(func.sum(Order.total_paid_cents), 0).label("sales_cents"),
             func.coalesce(func.count(Order.id), 0).label("orders_count"),
             func.coalesce(func.sum(Order.quantity), 0).label("units"),
         )
+        .select_from(Order)
+        .join(User, User.id == Order.buyer_user_id)
         .where(*filters)
-        .group_by(Order.buyer_user_id)
+        .group_by(User.id, User.username)
         .order_by(desc("sales_cents"))
-        .limit(limit)
+        .limit(int(limit))
     )
 
     stmt = _apply_time_filter(stmt, Order.created_at, r)
 
     res = await db.execute(stmt)
-    rows = res.all()
-
-    user_ids = [int(x.user_id) for x in rows if x.user_id is not None]
-    uname = await _username_map(db, user_ids)
-
     items = []
-    for x in rows:
-        uid = int(x.user_id)
+    for row in res.all():
         items.append(
             {
-                "user_id": uid,
-                "username": uname.get(uid, ""),
-                "sales_cents": int(x.sales_cents or 0),
-                "orders_count": int(x.orders_count or 0),
-                "units": int(x.units or 0),
+                "user_id": int(row.user_id),
+                "username": row.username or "",
+                "sales_cents": int(row.sales_cents or 0),
+                "orders_count": int(row.orders_count or 0),
+                "units": int(row.units or 0),
             }
         )
 
     return {"period": r.period, "date_from": r.date_from, "date_to": r.date_to, "items": items}
 
-
-# -------------------------
-# PROFIT (ledger-based)
-# -------------------------
 
 async def profit_by_seller(
     db: AsyncSession,
@@ -283,12 +522,12 @@ async def profit_by_seller(
     period: str,
     date_from: datetime | None,
     date_to: datetime | None,
-    user_ids: list[int] | None = None,
+    user_ids: list[int] | None,
     limit: int = 50,
 ) -> dict:
     r = _resolve_period(period, date_from, date_to)
 
-    filters = [WalletLedger.entry_kind.in_(sorted(PROFIT_ENTRY_KINDS)), WalletLedger.amount_cents > 0]
+    filters = [WalletLedger.entry_kind.in_(sorted(PROFIT_ENTRY_KINDS))]
     if user_ids is not None:
         filters.append(WalletLedger.user_id.in_([int(x) for x in user_ids]))
 
@@ -300,7 +539,7 @@ async def profit_by_seller(
         .where(*filters)
         .group_by(WalletLedger.user_id)
         .order_by(desc("profit_cents"))
-        .limit(limit)
+        .limit(int(limit))
     )
 
     stmt = _apply_time_filter(stmt, WalletLedger.created_at, r)
@@ -308,60 +547,24 @@ async def profit_by_seller(
     res = await db.execute(stmt)
     rows = res.all()
 
-    ids = [int(x.user_id) for x in rows if x.user_id is not None]
+    ids = [int(r.user_id) for r in rows if r.user_id is not None]
     uname = await _username_map(db, ids)
 
     items = []
-    for x in rows:
-        uid = int(x.user_id)
-        items.append({"user_id": uid, "username": uname.get(uid, ""), "profit_cents": int(x.profit_cents or 0)})
+    for row in rows:
+        uid = row.user_id
+        if uid is None:
+            continue
+        uid_int = int(uid)
+        items.append({"user_id": uid_int, "username": uname.get(uid_int, ""), "profit_cents": int(row.profit_cents or 0)})
 
     return {"period": r.period, "date_from": r.date_from, "date_to": r.date_to, "items": items}
 
 
-async def admin_income_totals(
-    db: AsyncSession,
-    *,
-    period: str,
-    date_from: datetime | None,
-    date_to: datetime | None,
-) -> dict:
-    r = _resolve_period(period, date_from, date_to)
-
-    base_case = case((WalletLedger.entry_kind == ADMIN_BASE_KIND, WalletLedger.amount_cents), else_=0)
-    profit_case = case((WalletLedger.entry_kind == PROFIT_KIND, WalletLedger.amount_cents), else_=0)
-
-    stmt = select(
-        func.coalesce(func.sum(base_case), 0),
-        func.coalesce(func.sum(profit_case), 0),
-    ).where(WalletLedger.amount_cents > 0)
-
-    stmt = _apply_time_filter(stmt, WalletLedger.created_at, r)
-
-    res = await db.execute(stmt)
-    row = res.first() or (0, 0)
-
-    base_cents = int(row[0] or 0)
-    profit_cents = int(row[1] or 0)
-
-    return {
-        "period": r.period,
-        "date_from": r.date_from,
-        "date_to": r.date_to,
-        "admin_base_cents": base_cents,
-        "admin_profit_cents": profit_cents,
-        "total_profit_cents": profit_cents,
-    }
-
-
-# -------------------------
-# BALANCES (wallet_accounts)
-# -------------------------
-
 async def balances_overview(
     db: AsyncSession,
     *,
-    user_ids: list[int] | None = None,
+    user_ids: list[int] | None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -369,42 +572,43 @@ async def balances_overview(
     if user_ids is not None:
         filters.append(WalletAccount.user_id.in_([int(x) for x in user_ids]))
 
-    total_stmt = select(func.count()).select_from(WalletAccount).where(*filters)
-    total_res = await db.execute(total_stmt)
-    total = int(total_res.scalar() or 0)
+    # total count
+    count_stmt = select(func.count(WalletAccount.user_id)).where(*filters)
+    total = int((await db.execute(count_stmt)).scalar_one() or 0)
 
     stmt = (
-        select(WalletAccount, User)
+        select(
+            WalletAccount.user_id,
+            User.username,
+            User.role,
+            WalletAccount.balance_cents,
+            WalletAccount.currency,
+            WalletAccount.updated_at,
+        )
         .select_from(WalletAccount)
         .join(User, User.id == WalletAccount.user_id)
         .where(*filters)
-        .order_by(WalletAccount.balance_cents.desc(), WalletAccount.user_id.asc())
-        .limit(limit)
-        .offset(offset)
+        .order_by(desc(WalletAccount.updated_at), WalletAccount.user_id)
+        .limit(int(limit))
+        .offset(int(offset))
     )
 
     res = await db.execute(stmt)
-    rows = res.all()
-
     items = []
-    for wa, u in rows:
+    for row in res.all():
         items.append(
             {
-                "user_id": int(wa.user_id),
-                "username": u.username or "",
-                "role": getattr(u, "role", "") or "",
-                "balance_cents": int(wa.balance_cents or 0),
-                "currency": wa.currency or "USD",
-                "updated_at": wa.updated_at,
+                "user_id": int(row.user_id),
+                "username": row.username or "",
+                "role": row.role or "",
+                "balance_cents": int(row.balance_cents or 0),
+                "currency": row.currency or "USD",
+                "updated_at": row.updated_at,
             }
         )
 
-    return {"items": items, "limit": limit, "offset": offset, "total": total}
+    return {"items": items, "limit": int(limit), "offset": int(offset), "total": total}
 
-
-# -------------------------
-# SUMMARY (cards)
-# -------------------------
 
 async def dashboard_summary_admin(
     db: AsyncSession,
@@ -414,7 +618,17 @@ async def dashboard_summary_admin(
     date_to: datetime | None,
 ) -> dict:
     totals = await sales_totals(db, period=period, date_from=date_from, date_to=date_to, buyer_user_ids=None)
-    income = await admin_income_totals(db, period=period, date_from=date_from, date_to=date_to)
+
+    # Admin base+profit totals from ledger
+    r = _resolve_period(period, date_from, date_to)
+
+    base_stmt = select(func.coalesce(func.sum(WalletLedger.amount_cents), 0)).where(WalletLedger.entry_kind == ADMIN_BASE_KIND)
+    base_stmt = _apply_time_filter(base_stmt, WalletLedger.created_at, r)
+    base_total = int((await db.execute(base_stmt)).scalar_one() or 0)
+
+    profit_stmt = select(func.coalesce(func.sum(WalletLedger.amount_cents), 0)).where(WalletLedger.entry_kind == PROFIT_KIND)
+    profit_stmt = _apply_time_filter(profit_stmt, WalletLedger.created_at, r)
+    profit_total = int((await db.execute(profit_stmt)).scalar_one() or 0)
 
     plan_rows = await sales_by_plan(db, period=period, date_from=date_from, date_to=date_to, buyer_user_ids=None, limit=1)
     seller_rows = await sales_by_seller(db, period=period, date_from=date_from, date_to=date_to, buyer_user_ids=None, limit=1)
@@ -429,9 +643,9 @@ async def dashboard_summary_admin(
         "total_sales_cents": totals["total_sales_cents"],
         "total_orders": totals["total_orders"],
         "total_units": totals["total_units"],
-        "admin_base_cents": income["admin_base_cents"],
-        "admin_profit_cents": income["admin_profit_cents"],
-        "total_profit_cents": income["total_profit_cents"],
+        "admin_base_cents": int(base_total),
+        "admin_profit_cents": int(profit_total),
+        "total_profit_cents": int(profit_total),
         "best_seller": best_seller or {},
         "best_plan": best_plan or {},
     }

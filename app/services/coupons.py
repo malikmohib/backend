@@ -6,12 +6,14 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import Integer, String, case, cast, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.coupon import Coupon
 from app.models.coupon_event import CouponEvent
 from app.models.plan import Plan
+from app.models.user import User
 
 
 def _generate_coupon_code() -> str:
@@ -173,6 +175,8 @@ async def admin_void_coupon(
     except Exception:
         await db.rollback()
         raise
+
+
 def _udid_suffix(udid: str) -> str:
     u = (udid or "").strip()
     if len(u) <= 6:
@@ -279,3 +283,208 @@ async def admin_mark_coupon_failed(
     except Exception:
         await db.rollback()
         raise
+
+
+async def seller_generate_coupons(
+    db: AsyncSession,
+    *,
+    plan_id: int,
+    count: int,
+    seller_user_id: int,
+    owner_user_id: int | None,
+    notes: str | None,
+) -> list[Coupon]:
+    """
+    Seller can generate coupons for:
+      - self
+      - optionally a DIRECT child (owner_user_id where parent_id == seller_user_id)
+
+    This MUST NOT allow generating for grandchildren or arbitrary users.
+    """
+    # Determine owner
+    target_owner_id = int(owner_user_id) if owner_user_id is not None else int(seller_user_id)
+
+    if target_owner_id != int(seller_user_id):
+        res = await db.execute(select(User.id, User.parent_id).where(User.id == target_owner_id))
+        row = res.first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Owner user not found")
+        parent_id = int(row[1]) if row[1] is not None else None
+        if parent_id != int(seller_user_id):
+            raise HTTPException(status_code=403, detail="Seller can only generate coupons for self or direct children")
+
+    # Create coupons under the target owner. created_by_user_id is always seller.
+    return await admin_generate_coupons(
+        db,
+        plan_id=plan_id,
+        count=count,
+        created_by_user_id=int(seller_user_id),
+        owner_user_id=target_owner_id,
+        notes=notes,
+    )
+
+
+async def seller_list_coupons(
+    db: AsyncSession,
+    *,
+    seller_user_id: int,
+    status: str | None,
+    plan_id: int | None,
+    owner_user_id: int | None,
+    limit: int,
+    offset: int,
+) -> list[Coupon]:
+    """
+    Seller can list coupons where owner is:
+      - self
+      - direct children
+
+    If owner_user_id is provided, it must be self or direct child.
+    """
+    # Compute allowed owner ids: self + direct children
+    child_res = await db.execute(select(User.id).where(User.parent_id == int(seller_user_id)))
+    child_ids = [int(x) for x in child_res.scalars().all()]
+    allowed_owner_ids = [int(seller_user_id)] + child_ids
+
+    if owner_user_id is not None:
+        oid = int(owner_user_id)
+        if oid not in allowed_owner_ids:
+            raise HTTPException(status_code=403, detail="Seller can only query self or direct children")
+        allowed_owner_ids = [oid]
+
+    stmt = select(Coupon).where(Coupon.owner_user_id.in_(allowed_owner_ids)).order_by(Coupon.created_at.desc())
+
+    if status:
+        stmt = stmt.where(Coupon.status == status)
+    if plan_id:
+        stmt = stmt.where(Coupon.plan_id == int(plan_id))
+
+    res = await db.execute(stmt.limit(int(limit)).offset(int(offset)))
+    return res.scalars().all()
+
+
+def _ltree_is_descendant_expr(user_path_col, ancestor_path: str):
+    # ltree operator: child_path <@ ancestor_path
+    return user_path_col.op("<@")(ancestor_path)
+
+
+def _direct_child_bucket_user_id_expr(
+    *,
+    leaf_id_col,
+    leaf_path_col,
+    seller_user_id: int,
+    seller_path_nlevel: int,
+):
+    """
+    Bucket any leaf user in seller subtree into:
+      - seller_user_id (if leaf == seller)
+      - else direct child id derived from leaf.path by slicing ONE segment after seller.
+
+    seller_path_nlevel is computed in Python (seller.depth + 1) to avoid calling
+    nlevel() on a VARCHAR parameter (which breaks on Postgres).
+    """
+    # child label ltree like: 'u123'
+    child_label_ltree = func.subpath(leaf_path_col, int(seller_path_nlevel), 1)
+    child_label_txt = cast(child_label_ltree, String)
+
+    # strip leading "u" => "123"
+    child_id_txt = func.substr(child_label_txt, 2)
+    child_id_int = cast(child_id_txt, Integer)
+
+    return case(
+        (leaf_id_col == int(seller_user_id), int(seller_user_id)),
+        else_=child_id_int,
+    )
+
+async def seller_recent_coupon_events_rollup(
+    db: AsyncSession,
+    *,
+    seller_user: User,
+    limit: int,
+    offset: int,
+) -> list[dict]:
+    """
+    Recent coupon events for the seller's *subtree* (direct+indirect),
+    but actor identity is bucketed to (self + direct children) based on coupon OWNER.
+
+    Returns dicts matching RecentCouponEventOut fields:
+      id, coupon_code, actor_user_id, event_type, created_at, status
+    """
+    Owner = aliased(User)
+
+    # Bucket by coupon owner path (not by raw actor) to avoid leaking grandchildren.
+    seller_path_nlevel = int(getattr(seller_user, "depth", 0)) + 1
+    
+    bucket_actor_id = _direct_child_bucket_user_id_expr(
+        leaf_id_col=Owner.id,
+        leaf_path_col=Owner.path,
+        seller_user_id=int(seller_user.id),
+        seller_path_nlevel=seller_path_nlevel,
+    ).label("bucket_actor_user_id")
+
+    stmt = (
+        select(
+            CouponEvent.id,
+            CouponEvent.coupon_code,
+            bucket_actor_id,
+            CouponEvent.event_type,
+            CouponEvent.created_at,
+            Coupon.status,
+        )
+        .select_from(CouponEvent)
+        .join(Coupon, Coupon.coupon_code == CouponEvent.coupon_code)
+        .join(Owner, Owner.id == Coupon.owner_user_id)
+        .where(_ltree_is_descendant_expr(Owner.path, str(seller_user.path)))
+        .order_by(CouponEvent.created_at.desc(), CouponEvent.id.desc())
+        .limit(int(limit))
+        .offset(int(offset))
+    )
+
+    res = await db.execute(stmt)
+    items: list[dict] = []
+    for r in res.all():
+        items.append(
+            {
+                "id": int(r[0]),
+                "coupon_code": str(r[1]),
+                "actor_user_id": (int(r[2]) if r[2] is not None else None),
+                "event_type": str(r[3]),
+                "created_at": r[4],
+                "status": str(r[5]),
+            }
+        )
+    return items
+
+
+async def seller_coupon_events_for_code_bucketed(
+    db: AsyncSession,
+    *,
+    seller_user: User,
+    coupon_code: str,
+) -> list[CouponEvent]:
+    """
+    Coupon events for a coupon, only if coupon owner is inside seller subtree.
+    Actor IDs are rewritten (in-router) to a bucket to avoid leaking grandchildren identities.
+
+    We return CouponEvent ORM rows; router will map to output schema while bucketizing actor_user_id.
+    """
+    # Ensure coupon exists and is within seller subtree by OWNER
+    Owner = aliased(User)
+    stmt = (
+        select(Coupon)
+        .join(Owner, Owner.id == Coupon.owner_user_id)
+        .where(Coupon.coupon_code == coupon_code)
+        .where(_ltree_is_descendant_expr(Owner.path, str(seller_user.path)))
+    )
+    res = await db.execute(stmt)
+    coupon = res.scalar_one_or_none()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+
+    ev_stmt = (
+        select(CouponEvent)
+        .where(CouponEvent.coupon_code == coupon_code)
+        .order_by(CouponEvent.created_at.asc(), CouponEvent.id.asc())
+    )
+    ev_res = await db.execute(ev_stmt)
+    return ev_res.scalars().all()

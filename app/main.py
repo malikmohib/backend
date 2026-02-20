@@ -24,6 +24,8 @@ from app.routers.purchases import router as purchases_router
 
 from app.routers.admin_coupons import router as admin_coupons_router
 from app.routers.admin_coupon_events import router as admin_coupon_events_router
+from app.routers.seller_coupons import router as seller_coupons_router
+from app.routers.seller_coupon_events import router as seller_coupon_events_router
 
 # Module E
 from app.routers.admin_orders import router as admin_orders_router
@@ -93,6 +95,8 @@ app.include_router(purchases_router)
 # Coupons
 app.include_router(admin_coupons_router)
 app.include_router(admin_coupon_events_router)
+app.include_router(seller_coupons_router)
+app.include_router(seller_coupon_events_router)
 
 # Orders (Module E)
 app.include_router(admin_orders_router)

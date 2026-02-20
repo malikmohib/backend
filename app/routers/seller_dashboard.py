@@ -19,9 +19,12 @@ from app.schemas.dashboard import (
 from app.services.dashboard import (
     balances_overview,
     dashboard_summary_seller_direct,
+    dashboard_summary_seller_rollup,
     profit_by_seller,
     sales_by_plan,
+    sales_by_plan_subtree,
     sales_by_seller,
+    sales_by_seller_rollup_direct,
     _direct_scope_user_ids,
 )
 
@@ -47,6 +50,27 @@ async def seller_dashboard_summary(
     return DashboardSummaryOut(**data)
 
 
+@router.get("/summary-rollup", response_model=DashboardSummaryOut)
+async def seller_dashboard_summary_rollup(
+    period: str = Query(default="today"),
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DashboardSummaryOut:
+    """
+    Roll up full subtree totals, but keep identity limited to (self + direct children).
+    """
+    data = await dashboard_summary_seller_rollup(
+        db,
+        current_user=current_user,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return DashboardSummaryOut(**data)
+
+
 @router.get("/sales-by-plan", response_model=SalesByPlanOut)
 async def seller_sales_by_plan(
     period: str = Query(default="today"),
@@ -61,6 +85,29 @@ async def seller_sales_by_plan(
     return SalesByPlanOut(**data)
 
 
+@router.get("/sales-by-plan-rollup", response_model=SalesByPlanOut)
+async def seller_sales_by_plan_rollup(
+    period: str = Query(default="today"),
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> SalesByPlanOut:
+    """
+    Full subtree plan breakdown.
+    """
+    data = await sales_by_plan_subtree(
+        db,
+        current_user_path=str(current_user.path),
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    return SalesByPlanOut(**data)
+
+
 @router.get("/sales-by-seller", response_model=SalesBySellerOut)
 async def seller_sales_by_seller(
     period: str = Query(default="today"),
@@ -72,6 +119,31 @@ async def seller_sales_by_seller(
 ) -> SalesBySellerOut:
     scope_ids = await _direct_scope_user_ids(db, current_user_id=int(current_user.id))
     data = await sales_by_seller(db, period=period, date_from=date_from, date_to=date_to, buyer_user_ids=scope_ids, limit=limit)
+    return SalesBySellerOut(**data)
+
+
+@router.get("/sales-by-seller-rollup", response_model=SalesBySellerOut)
+async def seller_sales_by_seller_rollup(
+    period: str = Query(default="today"),
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> SalesBySellerOut:
+    """
+    Full subtree seller breakdown bucketed to (self + direct children).
+    Grandchildren are rolled up under their direct parent.
+    """
+    data = await sales_by_seller_rollup_direct(
+        db,
+        current_user_id=int(current_user.id),
+        current_user_path=str(current_user.path),
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
     return SalesBySellerOut(**data)
 
 
