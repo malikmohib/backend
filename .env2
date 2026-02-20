@@ -1,0 +1,6 @@
+DATABASE_URL=postgresql+asyncpg://certify_user:12345@localhost:5432/certify
+
+JWT_SECRET=super_long_random_secret_change_me_123456789
+JWT_ISSUER=certify-dashboard
+JWT_EXPIRE_MINUTES=720
+BOT_API_KEY=CHANGE_ME_TOO
