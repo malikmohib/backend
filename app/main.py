@@ -56,6 +56,12 @@ from app.routers.admin_users_tree import router as admin_users_tree_router
 from app.routers.me import router as me_router
 from app.routers.auth_change_password import router as auth_change_password_router
 
+# ✅ NEW: seller users management (admin-like)
+from app.routers.seller_users_management import router as seller_users_management_router
+from app.routers.seller_balance_history import router as seller_balance_history_router
+from app.routers.seller_balance_history_rollup import router as seller_balance_history_rollup_router
+from app.routers.admin_balance_history import router as admin_balance_history_router
+
 app = FastAPI()
 
 # ✅ CORS for Next.js dev server (frontend)
@@ -124,5 +130,11 @@ app.include_router(seller_dashboard_router)
 app.include_router(admin_sellers.router)
 app.include_router(admin_users_tree_router)
 
+# ✅ NEW
+app.include_router(seller_users_management_router)
+
 app.include_router(me_router)
 app.include_router(auth_change_password_router)
+app.include_router(seller_balance_history_router)
+app.include_router(seller_balance_history_rollup_router)
+app.include_router(admin_balance_history_router)

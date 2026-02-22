@@ -79,7 +79,9 @@ class WalletLedgerRowOut(BaseModel):
     related_user_id: Optional[int]
     related_username: Optional[str]
     note: Optional[str]
+    balance_after_cents: Optional[int] = None
     created_at: datetime
+
 
 
 class WalletLedgerListOut(BaseModel):

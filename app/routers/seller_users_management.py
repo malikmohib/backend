@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from app.core.db import get_db
 from app.core.deps import require_seller
@@ -12,23 +12,23 @@ from app.models.seller_plan_price import SellerPlanPrice
 from app.models.user import User
 from app.models.wallet import WalletAccount
 from app.schemas.seller_users_management import (
+    SellerCreateChildSellerRequest,
+    SellerUpdateChildSellerRequest,
     SellerChildSellerListResponse,
     SellerChildSellerOut,
-    SellerCreateChildSellerRequest,
-    SellerDeleteChildIn,
     SellerPlanPriceOut,
     SellerSetChildBalanceIn,
-    SellerUpdateChildSellerRequest,
+    SellerDeleteChildIn,
 )
 from app.services.tree import create_user_under_parent
 from app.services.wallet import (
-    InsufficientBalance,
-    WalletError,
-    seller_delete_user_return_balance_to_parent,
     seller_set_balance_via_parent,
+    seller_delete_user_return_balance_to_parent,
+    WalletError,
+    InsufficientBalance,
 )
 
-router = APIRouter(prefix="/sellers", tags=["seller-users"])
+router = APIRouter(prefix="/sellers/users", tags=["Seller - Users Management"])
 
 
 async def _get_direct_child_or_404(db: AsyncSession, *, seller_id: int, child_id: int) -> User:
@@ -60,19 +60,18 @@ async def _seller_allowed_plan_prices(db: AsyncSession, seller_id: int, plan_ids
     return {int(r.plan_id): int(r.price_cents) for r in rows}
 
 
-@router.get("/users", response_model=SellerChildSellerListResponse)
+@router.get("", response_model=SellerChildSellerListResponse)
 async def seller_list_direct_children(
     db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
+    seller_user: User = Depends(require_seller),
 ) -> SellerChildSellerListResponse:
     # direct children only
     res = await db.execute(
-        select(User).where(User.parent_id == int(current_seller.id)).order_by(User.created_at.desc())
+        select(User).where(User.parent_id == int(seller_user.id)).order_by(User.created_at.desc())
     )
     children = res.scalars().all()
 
     child_ids = [int(u.id) for u in children]
-
     # wallets
     wallets_by_uid: dict[int, WalletAccount] = {}
     if child_ids:
@@ -96,6 +95,8 @@ async def seller_list_direct_children(
                     price_cents=int(pp.price_cents),
                 )
             )
+
+        # stable ordering (by title) for UI consistency
         for cid in plans_by_child:
             plans_by_child[cid].sort(key=lambda x: x.title)
 
@@ -106,9 +107,9 @@ async def seller_list_direct_children(
             SellerChildSellerOut(
                 id=int(u.id),
                 username=u.username,
-                role=u.role,  # always seller in our create endpoint
+                role=u.role,
                 parent_id=int(u.parent_id) if u.parent_id is not None else None,
-                parent_username=current_seller.username,
+                parent_username=seller_user.username,
                 full_name=u.full_name,
                 email=u.email,
                 phone=u.phone,
@@ -124,26 +125,30 @@ async def seller_list_direct_children(
     return SellerChildSellerListResponse(items=items)
 
 
-@router.post("/users", response_model=SellerChildSellerOut)
-async def seller_create_direct_child(
+@router.post("", response_model=SellerChildSellerOut)
+async def seller_create_direct_child_seller(
     payload: SellerCreateChildSellerRequest,
     db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
+    seller_user: User = Depends(require_seller),
 ) -> SellerChildSellerOut:
     """
     Seller creates a direct child seller.
-    Role is ALWAYS seller (no role in payload).
-    Can assign plans, but only those seller already has.
-    Child price must be >= seller price.
+
+    Rules:
+    - role is ALWAYS seller
+    - can only assign plans seller already has (seller_plan_prices)
+    - child price_cents must be >= seller's own price_cents for that plan
+    - no initial balance here (handled via /{child_id}/balance endpoint)
     """
 
     try:
+        # 1) Create user under seller
         child = await create_user_under_parent(
             db,
             username=payload.username,
             password=payload.password,
             role="seller",
-            parent=current_seller,
+            parent=seller_user,
             telegram_id=None,
             is_active=payload.is_active,
             full_name=payload.full_name,
@@ -153,17 +158,18 @@ async def seller_create_direct_child(
         )
         await db.flush()
 
-        # Ensure wallet exists for the child user
+        # 2) Ensure wallet exists (0 balance)
         db.add(WalletAccount(user_id=int(child.id), balance_cents=0, currency="USD"))
         await db.flush()
 
-        # Plans validation
+        # 3) Validate plan ids uniqueness
         plan_ids = [int(p.plan_id) for p in payload.plans]
         if len(plan_ids) != len(set(plan_ids)):
             raise HTTPException(status_code=400, detail="Duplicate plan_id in plans payload")
 
+        # 4) Validate plans exist + active
+        plans_by_id: dict[int, Plan] = {}
         if plan_ids:
-            # validate plans exist and active
             res_plans = await db.execute(select(Plan).where(Plan.id.in_(plan_ids)))
             found = res_plans.scalars().all()
             plans_by_id = {int(p.id): p for p in found}
@@ -176,8 +182,9 @@ async def seller_create_direct_child(
             if inactive:
                 raise HTTPException(status_code=400, detail=f"Inactive plan_id(s): {inactive}")
 
-            seller_prices = await _seller_allowed_plan_prices(db, int(current_seller.id), plan_ids)
-
+        # 5) Seller can only assign plans they already have; child price >= seller price
+        seller_prices = await _seller_allowed_plan_prices(db, int(seller_user.id), plan_ids)
+        if plan_ids:
             not_owned = [pid for pid in plan_ids if pid not in seller_prices]
             if not_owned:
                 raise HTTPException(status_code=400, detail=f"Forbidden plan_id(s): {not_owned}")
@@ -191,25 +198,24 @@ async def seller_create_direct_child(
                         detail=f"Plan {pid} price_cents must be >= your price ({seller_price})",
                     )
 
-            # insert child plan prices
-            for pp in payload.plans:
-                db.add(
-                    SellerPlanPrice(
-                        seller_id=int(child.id),
-                        plan_id=int(pp.plan_id),
-                        price_cents=int(pp.price_cents),
-                        currency="USD",
-                    )
+        # 6) Insert child plan prices
+        for pp in payload.plans:
+            db.add(
+                SellerPlanPrice(
+                    seller_id=int(child.id),
+                    plan_id=int(pp.plan_id),
+                    price_cents=int(pp.price_cents),
+                    currency="USD",
                 )
+            )
 
         await db.commit()
         await db.refresh(child)
 
-        # wallet
+        # 7) Fetch wallet + plans for response
         wa_res = await db.execute(select(WalletAccount).where(WalletAccount.user_id == int(child.id)))
         wa = wa_res.scalar_one_or_none()
 
-        # plans for response
         out_plans: list[SellerPlanPriceOut] = []
         if plan_ids:
             pp_res = await db.execute(
@@ -232,7 +238,7 @@ async def seller_create_direct_child(
             username=child.username,
             role=child.role,
             parent_id=int(child.parent_id) if child.parent_id is not None else None,
-            parent_username=current_seller.username,
+            parent_username=seller_user.username,
             full_name=child.full_name,
             email=child.email,
             phone=child.phone,
@@ -246,7 +252,7 @@ async def seller_create_direct_child(
 
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(status_code=400, detail="Username already exists (must be unique)")
+        raise HTTPException(status_code=400, detail="Username already exists")
     except HTTPException:
         await db.rollback()
         raise
@@ -254,15 +260,14 @@ async def seller_create_direct_child(
         await db.rollback()
         raise
 
-
-@router.patch("/users/{child_id}", response_model=SellerChildSellerOut)
-async def seller_update_direct_child(
+@router.patch("/{child_id}", response_model=SellerChildSellerOut)
+async def seller_update_direct_child_seller(
     child_id: int,
     payload: SellerUpdateChildSellerRequest,
     db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
+    seller_user: User = Depends(require_seller),
 ) -> SellerChildSellerOut:
-    child = await _get_direct_child_or_404(db, seller_id=int(current_seller.id), child_id=int(child_id))
+    child = await _get_direct_child_or_404(db, seller_id=int(seller_user.id), child_id=int(child_id))
 
     try:
         if payload.full_name is not None:
@@ -276,7 +281,7 @@ async def seller_update_direct_child(
         if payload.is_active is not None:
             child.is_active = payload.is_active
 
-        # full replace plans if provided
+        # plans full replace (same as admin)
         if payload.plans is not None:
             plan_ids = [int(p.plan_id) for p in payload.plans]
             if len(plan_ids) != len(set(plan_ids)):
@@ -296,7 +301,8 @@ async def seller_update_direct_child(
                 if inactive:
                     raise HTTPException(status_code=400, detail=f"Inactive plan_id(s): {inactive}")
 
-            seller_prices = await _seller_allowed_plan_prices(db, int(current_seller.id), plan_ids)
+            # seller can only assign plans they have; and child price >= seller price
+            seller_prices = await _seller_allowed_plan_prices(db, int(seller_user.id), plan_ids)
             if plan_ids:
                 not_owned = [pid for pid in plan_ids if pid not in seller_prices]
                 if not_owned:
@@ -311,30 +317,53 @@ async def seller_update_direct_child(
                             detail=f"Plan {pid} price_cents must be >= your price ({seller_price})",
                         )
 
-            # delete all existing then insert (simpler + safe here)
-            await db.execute(delete(SellerPlanPrice).where(SellerPlanPrice.seller_id == int(child.id)))
-            for pp in payload.plans:
-                db.add(
-                    SellerPlanPrice(
-                        seller_id=int(child.id),
-                        plan_id=int(pp.plan_id),
-                        price_cents=int(pp.price_cents),
-                        currency="USD",
+            # fetch existing
+            existing_res = await db.execute(
+                select(SellerPlanPrice).where(SellerPlanPrice.seller_id == int(child.id))
+            )
+            existing = existing_res.scalars().all()
+            existing_by_plan = {int(r.plan_id): r for r in existing}
+            incoming_by_plan = {int(p.plan_id): p for p in payload.plans}
+
+            # delete removed
+            removed = [pid for pid in existing_by_plan.keys() if pid not in incoming_by_plan]
+            if removed:
+                await db.execute(
+                    delete(SellerPlanPrice).where(
+                        SellerPlanPrice.seller_id == int(child.id),
+                        SellerPlanPrice.plan_id.in_(removed),
                     )
                 )
+
+            # update existing, insert new
+            for pid, pp in incoming_by_plan.items():
+                row = existing_by_plan.get(pid)
+                if row:
+                    row.price_cents = int(pp.price_cents)
+                else:
+                    db.add(
+                        SellerPlanPrice(
+                            seller_id=int(child.id),
+                            plan_id=int(pid),
+                            price_cents=int(pp.price_cents),
+                            currency="USD",
+                        )
+                    )
 
         await db.commit()
         await db.refresh(child)
 
+        # wallet
         wa_res = await db.execute(select(WalletAccount).where(WalletAccount.user_id == int(child.id)))
         wa = wa_res.scalar_one_or_none()
 
-        out_plans: list[SellerPlanPriceOut] = []
+        # plans
         pp_res = await db.execute(
             select(SellerPlanPrice, Plan)
             .join(Plan, Plan.id == SellerPlanPrice.plan_id)
             .where(SellerPlanPrice.seller_id == int(child.id))
         )
+        out_plans: list[SellerPlanPriceOut] = []
         for pp, plan in pp_res.all():
             out_plans.append(
                 SellerPlanPriceOut(
@@ -350,7 +379,7 @@ async def seller_update_direct_child(
             username=child.username,
             role=child.role,
             parent_id=int(child.parent_id) if child.parent_id is not None else None,
-            parent_username=current_seller.username,
+            parent_username=seller_user.username,
             full_name=child.full_name,
             email=child.email,
             phone=child.phone,
@@ -373,19 +402,20 @@ async def seller_update_direct_child(
         raise
 
 
-@router.post("/users/{child_id}/balance")
+@router.post("/{child_id}/balance")
 async def seller_set_child_balance(
     child_id: int,
     payload: SellerSetChildBalanceIn,
     db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
+    seller_user: User = Depends(require_seller),
 ):
-    await _get_direct_child_or_404(db, seller_id=int(current_seller.id), child_id=int(child_id))
+    # enforce direct child
+    await _get_direct_child_or_404(db, seller_id=int(seller_user.id), child_id=int(child_id))
 
     try:
         entries = await seller_set_balance_via_parent(
             db=db,
-            seller_user=current_seller,
+            seller_user=seller_user,
             target_user_id=int(child_id),
             target_balance_cents=int(payload.target_balance_cents),
             note=payload.note,
@@ -400,19 +430,20 @@ async def seller_set_child_balance(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.delete("/users/{child_id}")
+@router.delete("/{child_id}")
 async def seller_delete_child_seller(
     child_id: int,
     payload: SellerDeleteChildIn,
     db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
+    seller_user: User = Depends(require_seller),
 ):
-    await _get_direct_child_or_404(db, seller_id=int(current_seller.id), child_id=int(child_id))
+    # enforce direct child
+    await _get_direct_child_or_404(db, seller_id=int(seller_user.id), child_id=int(child_id))
 
     try:
         entries = await seller_delete_user_return_balance_to_parent(
             db=db,
-            seller_user=current_seller,
+            seller_user=seller_user,
             target_user_id=int(child_id),
             note=payload.note,
         )
@@ -421,16 +452,3 @@ async def seller_delete_child_seller(
     except WalletError as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/subtree", response_model=SellerChildSellerListResponse)
-async def seller_view_subtree_direct_only(
-    db: AsyncSession = Depends(get_db),
-    current_seller: User = Depends(require_seller),
-) -> SellerChildSellerListResponse:
-    """Legacy endpoint kept for compatibility.
-
-    Seller permission rules forbid exposing grandchildren structure.
-    This returns ONLY direct children.
-    """
-    return await seller_list_direct_children(db=db, current_seller=current_seller)

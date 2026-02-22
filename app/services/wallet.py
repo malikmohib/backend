@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Iterable
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
@@ -93,57 +93,10 @@ async def admin_topup(
     note: str | None,
 ) -> WalletLedger:
     """
-    Admin increases a user's balance.
-    Atomic: balance update + ledger insert.
+    Admin adds money into the system for a user (mint). Ledger kind: topup.
     """
     if admin_user.role != "admin":
-        raise WalletError("Only admin can topup.")
-
-    try:
-        accounts = await _lock_accounts(db, [target_user_id])
-        target = accounts[target_user_id]
-
-        new_balance = target.balance_cents + amount_cents
-
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == target_user_id)
-            .values(balance_cents=new_balance, updated_at=_now_utc())
-        )
-
-        entry = WalletLedger(
-            user_id=target_user_id,
-            entry_kind="admin_topup",
-            amount_cents=amount_cents,
-            currency=USD,
-            related_user_id=admin_user.id,
-            note=note,
-            meta={"by_admin_user_id": admin_user.id},
-        )
-        db.add(entry)
-
-        await db.commit()
-        await db.refresh(entry)
-        return entry
-
-    except Exception:
-        await db.rollback()
-        raise
-
-
-async def transfer_to_child(
-    db: AsyncSession,
-    sender: User,
-    child_user: User,
-    amount_cents: int,
-    note: str | None,
-) -> list[WalletLedger]:
-    """
-    Sender can transfer to DIRECT child only.
-    Atomic: sender debit + child credit + ledger entries.
-    """
-    if child_user.parent_id != sender.id:
-        raise ForbiddenTransfer("You can only transfer to your direct child.")
+        raise WalletError("Only admin can top up.")
 
     if amount_cents <= 0:
         raise WalletError("Amount must be positive.")
@@ -151,256 +104,107 @@ async def transfer_to_child(
     tx_id = uuid4()
 
     try:
-        accounts = await _lock_accounts(db, [sender.id, child_user.id])
-        sender_acc = accounts[sender.id]
-        child_acc = accounts[child_user.id]
-
-        if sender_acc.balance_cents < amount_cents:
-            raise InsufficientBalance("Insufficient balance.")
-
-        sender_new = sender_acc.balance_cents - amount_cents
-        child_new = child_acc.balance_cents + amount_cents
-
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == sender.id)
-            .values(balance_cents=sender_new, updated_at=_now_utc())
-        )
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == child_user.id)
-            .values(balance_cents=child_new, updated_at=_now_utc())
-        )
-
-        out_entry = WalletLedger(
-            tx_id=tx_id,
-            user_id=sender.id,
-            entry_kind="transfer_out",
-            amount_cents=-amount_cents,
-            currency=USD,
-            related_user_id=child_user.id,
-            note=note,
-            meta={"to_user_id": child_user.id},
-        )
-        in_entry = WalletLedger(
-            tx_id=tx_id,
-            user_id=child_user.id,
-            entry_kind="transfer_in",
-            amount_cents=amount_cents,
-            currency=USD,
-            related_user_id=sender.id,
-            note=note,
-            meta={"from_user_id": sender.id},
-        )
-
-        db.add(out_entry)
-        db.add(in_entry)
-
-        await db.commit()
-        await db.refresh(out_entry)
-        await db.refresh(in_entry)
-        return [out_entry, in_entry]
-
-    except Exception:
-        await db.rollback()
-        raise
-
-
-async def adjust_child_balance_down(
-    db: AsyncSession,
-    sender: User,
-    child_user: User,
-    target_balance_cents: int,
-    note: str | None,
-) -> list[WalletLedger]:
-    """
-    Reduce a direct child's balance and return the difference back to sender.
-
-    IMPORTANT: wallet_ledger.entry_kind is constrained by DB check constraint.
-    So we record this as a "transfer" from child -> parent using allowed kinds:
-    - child: transfer_out (-delta)
-    - parent: transfer_in (+delta)
-    """
-    if child_user.parent_id != sender.id:
-        raise ForbiddenTransfer("You can only adjust your direct child.")
-
-    if target_balance_cents < 0:
-        raise WalletError("Target balance cannot be negative.")
-
-    tx_id = uuid4()
-
-    try:
-        accounts = await _lock_accounts(db, [sender.id, child_user.id])
-        sender_acc = accounts[sender.id]
-        child_acc = accounts[child_user.id]
-
-        current_child_balance = int(child_acc.balance_cents)
-
-        if target_balance_cents > current_child_balance:
-            raise WalletError("Target balance exceeds current balance.")
-
-        delta = current_child_balance - int(target_balance_cents)
-        if delta == 0:
-            raise WalletError("Target balance equals current balance.")
-
-        # Apply delta: child decreases, sender increases
-        child_new = current_child_balance - delta
-        sender_new = int(sender_acc.balance_cents) + delta
-
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == child_user.id)
-            .values(balance_cents=child_new, updated_at=_now_utc())
-        )
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == sender.id)
-            .values(balance_cents=sender_new, updated_at=_now_utc())
-        )
-
-        # Record as transfer child -> parent (allowed entry kinds)
-        out_entry = WalletLedger(
-            tx_id=tx_id,
-            user_id=child_user.id,
-            entry_kind="transfer_out",
-            amount_cents=-delta,
-            currency=USD,
-            related_user_id=sender.id,
-            note=note,
-            meta={
-                "kind": "balance_adjustment",
-                "to_user_id": sender.id,
-                "adjusted_by_user_id": sender.id,
-                "target_balance_cents": int(target_balance_cents),
-            },
-        )
-        in_entry = WalletLedger(
-            tx_id=tx_id,
-            user_id=sender.id,
-            entry_kind="transfer_in",
-            amount_cents=delta,
-            currency=USD,
-            related_user_id=child_user.id,
-            note=note,
-            meta={
-                "kind": "balance_adjustment",
-                "from_user_id": child_user.id,
-                "adjusted_child_user_id": child_user.id,
-                "target_balance_cents": int(target_balance_cents),
-            },
-        )
-
-        db.add(out_entry)
-        db.add(in_entry)
-
-        await db.commit()
-        await db.refresh(out_entry)
-        await db.refresh(in_entry)
-        return [out_entry, in_entry]
-
-    except Exception:
-        await db.rollback()
-        raise
-
-
-
-async def admin_adjust_balance(
-    db: AsyncSession,
-    admin_user: User,
-    target_user_id: int,
-    amount_cents: int,
-    note: str | None,
-) -> list[WalletLedger]:
-    """
-    Admin adjusts a user's balance:
-    - amount_cents > 0: admin_topup (entry_kind=admin_topup)
-    - amount_cents < 0: record as transfer target -> admin using allowed kinds
-      (transfer_out for target, transfer_in for admin)
-    Atomic: balance update(s) + ledger insert(s).
-    """
-    if admin_user.role != "admin":
-        raise WalletError("Only admin can adjust balance.")
-
-    if amount_cents == 0:
-        raise WalletError("Amount cannot be 0.")
-
-    # Positive: reuse existing logic
-    if amount_cents > 0:
-        entry = await admin_topup(
-            db=db,
-            admin_user=admin_user,
-            target_user_id=target_user_id,
-            amount_cents=amount_cents,
-            note=note,
-        )
-        return [entry]
-
-    # Negative: transfer target -> admin (allowed entry kinds)
-    tx_id = uuid4()
-    debit = -int(amount_cents)  # positive number to debit from target
-
-    try:
-        accounts = await _lock_accounts(db, [target_user_id, int(admin_user.id)])
+        accounts = await _lock_accounts(db, [target_user_id])
         target_acc = accounts[target_user_id]
-        admin_acc = accounts[int(admin_user.id)]
 
-        if int(target_acc.balance_cents) < debit:
-            raise InsufficientBalance("Insufficient balance.")
-
-        target_new = int(target_acc.balance_cents) - debit
-        admin_new = int(admin_acc.balance_cents) + debit
+        new_bal = int(target_acc.balance_cents) + int(amount_cents)
 
         await db.execute(
             update(WalletAccount)
             .where(WalletAccount.user_id == target_user_id)
-            .values(balance_cents=target_new, updated_at=_now_utc())
-        )
-        await db.execute(
-            update(WalletAccount)
-            .where(WalletAccount.user_id == int(admin_user.id))
-            .values(balance_cents=admin_new, updated_at=_now_utc())
+            .values(balance_cents=new_bal, updated_at=_now_utc())
         )
 
-        out_entry = WalletLedger(
+        entry = WalletLedger(
             tx_id=tx_id,
             user_id=target_user_id,
-            entry_kind="transfer_out",
-            amount_cents=-debit,
+            entry_kind="topup",
+            amount_cents=int(amount_cents),
             currency=USD,
             related_user_id=int(admin_user.id),
-            note=note,
+            note=note or "Admin topup",
             meta={
-                "kind": "admin_adjustment",
+                "kind": "admin_topup",
                 "by_admin_user_id": int(admin_user.id),
-                "to_user_id": int(admin_user.id),
             },
         )
-        in_entry = WalletLedger(
-            tx_id=tx_id,
-            user_id=int(admin_user.id),
-            entry_kind="transfer_in",
-            amount_cents=debit,
-            currency=USD,
-            related_user_id=target_user_id,
-            note=note,
-            meta={
-                "kind": "admin_adjustment",
-                "by_admin_user_id": int(admin_user.id),
-                "from_user_id": target_user_id,
-            },
-        )
-
-        db.add(out_entry)
-        db.add(in_entry)
-
-        await db.commit()
-        await db.refresh(out_entry)
-        await db.refresh(in_entry)
-        return [out_entry, in_entry]
+        db.add(entry)
+        await db.flush()
+        return entry
 
     except Exception:
-        await db.rollback()
         raise
+
+
+async def transfer_between_users(
+    db: AsyncSession,
+    from_user_id: int,
+    to_user_id: int,
+    amount_cents: int,
+    note: str | None,
+    *,
+    meta: dict | None = None,
+) -> list[WalletLedger]:
+    """
+    Generic transfer from one user to another with ledger entries.
+    """
+    if amount_cents <= 0:
+        raise WalletError("Amount must be positive.")
+
+    if int(from_user_id) == int(to_user_id):
+        raise WalletError("Cannot transfer to same user.")
+
+    tx_id = uuid4()
+
+    accounts = await _lock_accounts(db, [int(from_user_id), int(to_user_id)])
+    from_acc = accounts[int(from_user_id)]
+    to_acc = accounts[int(to_user_id)]
+
+    if int(from_acc.balance_cents) < int(amount_cents):
+        raise InsufficientBalance("Insufficient balance.")
+
+    from_new = int(from_acc.balance_cents) - int(amount_cents)
+    to_new = int(to_acc.balance_cents) + int(amount_cents)
+
+    await db.execute(
+        update(WalletAccount)
+        .where(WalletAccount.user_id == int(from_user_id))
+        .values(balance_cents=from_new, updated_at=_now_utc())
+    )
+    await db.execute(
+        update(WalletAccount)
+        .where(WalletAccount.user_id == int(to_user_id))
+        .values(balance_cents=to_new, updated_at=_now_utc())
+    )
+
+    out_entry = WalletLedger(
+        tx_id=tx_id,
+        user_id=int(from_user_id),
+        entry_kind="transfer_out",
+        amount_cents=-int(amount_cents),
+        currency=USD,
+        related_user_id=int(to_user_id),
+        note=note or "Transfer out",
+        meta=meta or {},
+    )
+    in_entry = WalletLedger(
+        tx_id=tx_id,
+        user_id=int(to_user_id),
+        entry_kind="transfer_in",
+        amount_cents=int(amount_cents),
+        currency=USD,
+        related_user_id=int(from_user_id),
+        note=note or "Transfer in",
+        meta=meta or {},
+    )
+
+    db.add(out_entry)
+    db.add(in_entry)
+    await db.flush()
+
+    return [out_entry, in_entry]
+
+
 async def admin_set_balance_via_parent(
     db: AsyncSession,
     admin_user: User,
@@ -468,279 +272,92 @@ async def admin_set_balance_via_parent(
                 .values(balance_cents=child_new, updated_at=_now_utc())
             )
 
-            parent_entry = WalletLedger(
+            out_entry = WalletLedger(
                 tx_id=tx_id,
                 user_id=parent_id,
                 entry_kind="transfer_out",
                 amount_cents=-delta,
                 currency=USD,
                 related_user_id=target_user_id,
-                note=note,
+                note=note or "Set balance via parent",
                 meta={
-                    "kind": "admin_set_balance",
+                    "kind": "admin_set_balance_via_parent",
                     "by_admin_user_id": int(admin_user.id),
-                    "to_user_id": target_user_id,
-                    "target_balance_cents": target,
+                    "child_user_id": int(target_user_id),
                 },
             )
-            child_entry = WalletLedger(
+            in_entry = WalletLedger(
                 tx_id=tx_id,
                 user_id=target_user_id,
                 entry_kind="transfer_in",
                 amount_cents=delta,
                 currency=USD,
                 related_user_id=parent_id,
-                note=note,
+                note=note or "Set balance via parent",
                 meta={
-                    "kind": "admin_set_balance",
+                    "kind": "admin_set_balance_via_parent",
                     "by_admin_user_id": int(admin_user.id),
-                    "from_user_id": parent_id,
-                    "target_balance_cents": target,
+                    "parent_user_id": parent_id,
                 },
             )
+            db.add(out_entry)
+            db.add(in_entry)
+            await db.flush()
+            return [out_entry, in_entry]
 
-            db.add(parent_entry)
-            db.add(child_entry)
+        # target < current: child pays parent
+        delta = current - target
 
-            await db.commit()
-            await db.refresh(parent_entry)
-            await db.refresh(child_entry)
-            return [parent_entry, child_entry]
+        parent_new = int(parent_acc.balance_cents) + delta
+        child_new = current - delta
 
-        else:
-            # Child returns to parent
-            delta = current - target
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == parent_id)
+            .values(balance_cents=parent_new, updated_at=_now_utc())
+        )
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == target_user_id)
+            .values(balance_cents=child_new, updated_at=_now_utc())
+        )
 
-            child_new = current - delta
-            parent_new = int(parent_acc.balance_cents) + delta
-
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == target_user_id)
-                .values(balance_cents=child_new, updated_at=_now_utc())
-            )
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == parent_id)
-                .values(balance_cents=parent_new, updated_at=_now_utc())
-            )
-
-            child_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=target_user_id,
-                entry_kind="transfer_out",
-                amount_cents=-delta,
-                currency=USD,
-                related_user_id=parent_id,
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "by_admin_user_id": int(admin_user.id),
-                    "to_user_id": parent_id,
-                    "target_balance_cents": target,
-                },
-            )
-            parent_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=parent_id,
-                entry_kind="transfer_in",
-                amount_cents=delta,
-                currency=USD,
-                related_user_id=target_user_id,
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "by_admin_user_id": int(admin_user.id),
-                    "from_user_id": target_user_id,
-                    "target_balance_cents": target,
-                },
-            )
-
-            db.add(child_entry)
-            db.add(parent_entry)
-
-            await db.commit()
-            await db.refresh(child_entry)
-            await db.refresh(parent_entry)
-            return [child_entry, parent_entry]
+        out_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=target_user_id,
+            entry_kind="transfer_out",
+            amount_cents=-delta,
+            currency=USD,
+            related_user_id=parent_id,
+            note=note or "Set balance via parent",
+            meta={
+                "kind": "admin_set_balance_via_parent",
+                "by_admin_user_id": int(admin_user.id),
+                "to_parent_user_id": parent_id,
+            },
+        )
+        in_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=parent_id,
+            entry_kind="transfer_in",
+            amount_cents=delta,
+            currency=USD,
+            related_user_id=target_user_id,
+            note=note or "Set balance via parent",
+            meta={
+                "kind": "admin_set_balance_via_parent",
+                "by_admin_user_id": int(admin_user.id),
+                "from_child_user_id": int(target_user_id),
+            },
+        )
+        db.add(out_entry)
+        db.add(in_entry)
+        await db.flush()
+        return [out_entry, in_entry]
 
     except Exception:
-        await db.rollback()
         raise
 
-async def admin_set_balance_via_parent(
-    db: AsyncSession,
-    admin_user: User,
-    target_user_id: int,
-    target_balance_cents: int,
-    note: str | None,
-) -> list[WalletLedger]:
-    """
-    Admin sets seller balance EXACTLY to target_balance_cents using parent funds.
-
-    If target > current:
-      parent transfer_out (-(delta)), child transfer_in (+(delta))
-
-    If target < current:
-      child transfer_out (-(delta)), parent transfer_in (+(delta))
-
-    Uses only allowed kinds: transfer_out / transfer_in
-    """
-    if admin_user.role != "admin":
-        raise WalletError("Only admin can set balance.")
-
-    if target_balance_cents < 0:
-        raise WalletError("Target balance cannot be negative.")
-
-    # fetch target user
-    res = await db.execute(select(User).where(User.id == target_user_id))
-    child_user = res.scalar_one_or_none()
-    if child_user is None:
-        raise WalletError(f"User {target_user_id} not found.")
-
-    if child_user.parent_id is None:
-        raise WalletError("Target user has no parent.")
-
-    parent_id = int(child_user.parent_id)
-
-    tx_id = uuid4()
-
-    try:
-        accounts = await _lock_accounts(db, [parent_id, int(child_user.id)])
-        parent_acc = accounts[parent_id]
-        child_acc = accounts[int(child_user.id)]
-
-        current = int(child_acc.balance_cents)
-        target = int(target_balance_cents)
-
-        if target == current:
-            raise WalletError("Target balance equals current balance.")
-
-        delta = target - current  # + means child needs money, - means child returns money
-
-        entries: list[WalletLedger] = []
-
-        # child needs +delta => parent pays
-        if delta > 0:
-            if int(parent_acc.balance_cents) < delta:
-                raise InsufficientBalance("Parent has insufficient balance.")
-
-            parent_new = int(parent_acc.balance_cents) - delta
-            child_new = current + delta
-
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == parent_id)
-                .values(balance_cents=parent_new, updated_at=_now_utc())
-            )
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == int(child_user.id))
-                .values(balance_cents=child_new, updated_at=_now_utc())
-            )
-
-            parent_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=parent_id,
-                entry_kind="transfer_out",
-                amount_cents=-delta,
-                currency=USD,
-                related_user_id=int(child_user.id),
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "direction": "parent_to_child",
-                    "child_user_id": int(child_user.id),
-                    "target_balance_cents": target,
-                    "by_admin_user_id": int(admin_user.id),
-                },
-            )
-
-            child_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=int(child_user.id),
-                entry_kind="transfer_in",
-                amount_cents=delta,
-                currency=USD,
-                related_user_id=parent_id,
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "direction": "parent_to_child",
-                    "parent_user_id": parent_id,
-                    "target_balance_cents": target,
-                    "by_admin_user_id": int(admin_user.id),
-                },
-            )
-
-            db.add(parent_entry)
-            db.add(child_entry)
-            entries.extend([parent_entry, child_entry])
-
-        # child returns -delta => parent receives
-        else:
-            give_back = -delta  # positive
-
-            child_new = current - give_back
-            parent_new = int(parent_acc.balance_cents) + give_back
-
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == int(child_user.id))
-                .values(balance_cents=child_new, updated_at=_now_utc())
-            )
-            await db.execute(
-                update(WalletAccount)
-                .where(WalletAccount.user_id == parent_id)
-                .values(balance_cents=parent_new, updated_at=_now_utc())
-            )
-
-            child_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=int(child_user.id),
-                entry_kind="transfer_out",
-                amount_cents=-give_back,
-                currency=USD,
-                related_user_id=parent_id,
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "direction": "child_to_parent",
-                    "parent_user_id": parent_id,
-                    "target_balance_cents": target,
-                    "by_admin_user_id": int(admin_user.id),
-                },
-            )
-
-            parent_entry = WalletLedger(
-                tx_id=tx_id,
-                user_id=parent_id,
-                entry_kind="transfer_in",
-                amount_cents=give_back,
-                currency=USD,
-                related_user_id=int(child_user.id),
-                note=note,
-                meta={
-                    "kind": "admin_set_balance",
-                    "direction": "child_to_parent",
-                    "child_user_id": int(child_user.id),
-                    "target_balance_cents": target,
-                    "by_admin_user_id": int(admin_user.id),
-                },
-            )
-
-            db.add(child_entry)
-            db.add(parent_entry)
-            entries.extend([child_entry, parent_entry])
-
-        await db.commit()
-        for e in entries:
-            await db.refresh(e)
-        return entries
-
-    except Exception:
-        await db.rollback()
-        raise
 
 async def admin_delete_user_return_balance_to_parent(
     db: AsyncSession,
@@ -815,25 +432,420 @@ async def admin_delete_user_return_balance_to_parent(
                 note=note or "Return balance to parent (delete user)",
                 meta={
                     "kind": "delete_return_balance",
-                    "from_user_id": int(target_user.id),
                     "deleted_user_id": int(target_user.id),
+                    "to_user_id": parent_id,
                     "by_admin_user_id": int(admin_user.id),
                 },
             )
-
             db.add(out_entry)
             db.add(in_entry)
-            entries.extend([out_entry, in_entry])
-
-            # ✅ flush ensures ledger is inserted while user still exists
             await db.flush()
 
-        # ✅ delete LAST
-        await db.delete(target_user)
-        await db.commit()
+            entries.extend([out_entry, in_entry])
+
+        # ✅ Delete related wallet account and user
+        await db.execute(delete(WalletAccount).where(WalletAccount.user_id == int(target_user.id)))
+        await db.execute(delete(User).where(User.id == int(target_user.id)))
 
         return entries
 
     except Exception:
-        await db.rollback()
         raise
+
+
+# -----------------------------
+# ✅ SELLER-scoped variants
+# -----------------------------
+
+async def seller_set_balance_via_parent(
+    db: AsyncSession,
+    seller_user: User,
+    target_user_id: int,
+    target_balance_cents: int,
+    note: str | None,
+) -> list[WalletLedger]:
+    """
+    Seller sets direct child seller balance by transferring delta between seller and child.
+
+    Permission:
+    - seller_user.role must be 'seller'
+    - target_user.parent_id must equal seller_user.id
+    """
+    if seller_user.role != "seller":
+        raise WalletError("Only seller can set balance here.")
+
+    if target_balance_cents < 0:
+        raise WalletError("Target balance cannot be negative.")
+
+    res = await db.execute(select(User).where(User.id == int(target_user_id)))
+    target_user = res.scalar_one_or_none()
+    if target_user is None:
+        raise WalletError("User not found.")
+
+    if target_user.parent_id is None or int(target_user.parent_id) != int(seller_user.id):
+        raise WalletError("Forbidden: can only set balance for direct children.")
+
+    parent_id = int(seller_user.id)
+    tx_id = uuid4()
+
+    accounts = await _lock_accounts(db, [int(target_user_id), parent_id])
+    child_acc = accounts[int(target_user_id)]
+    parent_acc = accounts[parent_id]
+
+    current = int(child_acc.balance_cents)
+    target = int(target_balance_cents)
+
+    if target == current:
+        raise WalletError("Target balance equals current balance.")
+
+    if target > current:
+        # Seller pays child
+        delta = target - current
+
+        if int(parent_acc.balance_cents) < delta:
+            raise InsufficientBalance("Insufficient seller balance.")
+
+        parent_new = int(parent_acc.balance_cents) - delta
+        child_new = current + delta
+
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == parent_id)
+            .values(balance_cents=parent_new, updated_at=_now_utc())
+        )
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == int(target_user_id))
+            .values(balance_cents=child_new, updated_at=_now_utc())
+        )
+
+        out_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=parent_id,
+            entry_kind="transfer_out",
+            amount_cents=-delta,
+            currency=USD,
+            related_user_id=int(target_user_id),
+            note=note or "Set balance via parent",
+            meta={
+                "kind": "seller_set_balance_via_parent",
+                "by_seller_user_id": int(seller_user.id),
+                "child_user_id": int(target_user_id),
+            },
+        )
+        in_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=int(target_user_id),
+            entry_kind="transfer_in",
+            amount_cents=delta,
+            currency=USD,
+            related_user_id=parent_id,
+            note=note or "Set balance via parent",
+            meta={
+                "kind": "seller_set_balance_via_parent",
+                "by_seller_user_id": int(seller_user.id),
+                "parent_user_id": parent_id,
+            },
+        )
+        db.add(out_entry)
+        db.add(in_entry)
+        await db.flush()
+        return [out_entry, in_entry]
+
+    # target < current: child pays seller
+    delta = current - target
+
+    parent_new = int(parent_acc.balance_cents) + delta
+    child_new = current - delta
+
+    await db.execute(
+        update(WalletAccount)
+        .where(WalletAccount.user_id == parent_id)
+        .values(balance_cents=parent_new, updated_at=_now_utc())
+    )
+    await db.execute(
+        update(WalletAccount)
+        .where(WalletAccount.user_id == int(target_user_id))
+        .values(balance_cents=child_new, updated_at=_now_utc())
+    )
+
+    out_entry = WalletLedger(
+        tx_id=tx_id,
+        user_id=int(target_user_id),
+        entry_kind="transfer_out",
+        amount_cents=-delta,
+        currency=USD,
+        related_user_id=parent_id,
+        note=note or "Set balance via parent",
+        meta={
+            "kind": "seller_set_balance_via_parent",
+            "by_seller_user_id": int(seller_user.id),
+            "to_parent_user_id": parent_id,
+        },
+    )
+    in_entry = WalletLedger(
+        tx_id=tx_id,
+        user_id=parent_id,
+        entry_kind="transfer_in",
+        amount_cents=delta,
+        currency=USD,
+        related_user_id=int(target_user_id),
+        note=note or "Set balance via parent",
+        meta={
+            "kind": "seller_set_balance_via_parent",
+            "by_seller_user_id": int(seller_user.id),
+            "from_child_user_id": int(target_user_id),
+        },
+    )
+    db.add(out_entry)
+    db.add(in_entry)
+    await db.flush()
+    return [out_entry, in_entry]
+
+
+async def seller_delete_user_return_balance_to_parent(
+    db: AsyncSession,
+    seller_user: User,
+    target_user_id: int,
+    note: str | None,
+) -> list[WalletLedger]:
+    """
+    Seller deletes a direct child user.
+    If child balance > 0: move it to seller FIRST (ledger while child exists), THEN delete.
+
+    Permission:
+    - seller_user.role must be 'seller'
+    - target_user.parent_id must equal seller_user.id
+    """
+    if seller_user.role != "seller":
+        raise WalletError("Only seller can delete users here.")
+
+    res = await db.execute(select(User).where(User.id == int(target_user_id)))
+    target_user = res.scalar_one_or_none()
+    if target_user is None:
+        raise WalletError("User not found.")
+
+    if target_user.parent_id is None or int(target_user.parent_id) != int(seller_user.id):
+        raise WalletError("Forbidden: can only delete direct children.")
+
+    parent_id = int(seller_user.id)
+    tx_id = uuid4()
+
+    accounts = await _lock_accounts(db, [int(target_user.id), parent_id])
+    child_acc = accounts[int(target_user.id)]
+    parent_acc = accounts[parent_id]
+
+    child_balance = int(child_acc.balance_cents)
+    entries: list[WalletLedger] = []
+
+    if child_balance > 0:
+        parent_new = int(parent_acc.balance_cents) + child_balance
+
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == parent_id)
+            .values(balance_cents=parent_new, updated_at=_now_utc())
+        )
+        await db.execute(
+            update(WalletAccount)
+            .where(WalletAccount.user_id == int(target_user.id))
+            .values(balance_cents=0, updated_at=_now_utc())
+        )
+
+        out_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=int(target_user.id),
+            entry_kind="transfer_out",
+            amount_cents=-child_balance,
+            currency=USD,
+            related_user_id=parent_id,
+            note=note or "Return balance to parent (delete user)",
+            meta={
+                "kind": "delete_return_balance",
+                "deleted_user_id": int(target_user.id),
+                "to_user_id": parent_id,
+                "by_seller_user_id": int(seller_user.id),
+            },
+        )
+        in_entry = WalletLedger(
+            tx_id=tx_id,
+            user_id=parent_id,
+            entry_kind="transfer_in",
+            amount_cents=child_balance,
+            currency=USD,
+            related_user_id=int(target_user.id),
+            note=note or "Return balance to parent (delete user)",
+            meta={
+                "kind": "delete_return_balance",
+                "deleted_user_id": int(target_user.id),
+                "to_user_id": parent_id,
+                "by_seller_user_id": int(seller_user.id),
+            },
+        )
+        db.add(out_entry)
+        db.add(in_entry)
+        await db.flush()
+        entries.extend([out_entry, in_entry])
+
+    await db.execute(delete(WalletAccount).where(WalletAccount.user_id == int(target_user.id)))
+    await db.execute(delete(User).where(User.id == int(target_user.id)))
+
+    return entries
+
+
+# -------------------------------------------------------
+# ✅ BACKWARD-COMPATIBILITY HELPERS (required by seller_wallet)
+# -------------------------------------------------------
+
+async def adjust_child_balance_up(
+    db: AsyncSession,
+    parent_user: User,
+    child_user_id: int,
+    amount_cents: int,
+    note: str | None = None,
+) -> list[WalletLedger]:
+    """
+    Legacy helper expected by existing routers:
+    Increase child's balance by transferring FROM parent -> child.
+
+    Safety:
+    - locks both accounts FOR UPDATE
+    - checks parent has enough balance
+    - writes wallet_ledger entries
+    - enforces direct parent relationship
+    """
+    if amount_cents <= 0:
+        raise WalletError("Amount must be positive.")
+
+    res = await db.execute(select(User).where(User.id == int(child_user_id)))
+    child = res.scalar_one_or_none()
+    if child is None:
+        raise WalletError("User not found.")
+
+    if child.parent_id is None or int(child.parent_id) != int(parent_user.id):
+        raise WalletError("Forbidden: can only adjust balance for direct children.")
+
+    return await transfer_between_users(
+        db=db,
+        from_user_id=int(parent_user.id),
+        to_user_id=int(child_user_id),
+        amount_cents=int(amount_cents),
+        note=note or "Adjust child balance up",
+        meta={
+            "kind": "adjust_child_balance_up",
+            "parent_user_id": int(parent_user.id),
+            "child_user_id": int(child_user_id),
+        },
+    )
+
+
+async def adjust_child_balance_down(
+    db: AsyncSession,
+    parent_user: User,
+    child_user_id: int,
+    amount_cents: int,
+    note: str | None = None,
+) -> list[WalletLedger]:
+    """
+    Legacy helper expected by existing routers:
+    Decrease child's balance by transferring FROM child -> parent.
+
+    Safety:
+    - locks both accounts FOR UPDATE
+    - checks child has enough balance
+    - writes wallet_ledger entries
+    - enforces direct parent relationship
+    """
+    if amount_cents <= 0:
+        raise WalletError("Amount must be positive.")
+
+    res = await db.execute(select(User).where(User.id == int(child_user_id)))
+    child = res.scalar_one_or_none()
+    if child is None:
+        raise WalletError("User not found.")
+
+    if child.parent_id is None or int(child.parent_id) != int(parent_user.id):
+        raise WalletError("Forbidden: can only adjust balance for direct children.")
+
+    return await transfer_between_users(
+        db=db,
+        from_user_id=int(child_user_id),
+        to_user_id=int(parent_user.id),
+        amount_cents=int(amount_cents),
+        note=note or "Adjust child balance down",
+        meta={
+            "kind": "adjust_child_balance_down",
+            "parent_user_id": int(parent_user.id),
+            "child_user_id": int(child_user_id),
+        },
+    )
+async def transfer_to_child(
+    db: AsyncSession,
+    parent_user: User,
+    child_user_id: int,
+    amount_cents: int,
+    note: str | None = None,
+) -> list[WalletLedger]:
+    """
+    Legacy helper expected by seller_wallet.
+    Transfer from parent -> direct child with ledger + row locks.
+    """
+    if amount_cents <= 0:
+        raise WalletError("Amount must be positive.")
+
+    res = await db.execute(select(User).where(User.id == int(child_user_id)))
+    child = res.scalar_one_or_none()
+    if child is None:
+        raise WalletError("User not found.")
+
+    if child.parent_id is None or int(child.parent_id) != int(parent_user.id):
+        raise WalletError("Forbidden: can only transfer to direct children.")
+
+    return await transfer_between_users(
+        db=db,
+        from_user_id=int(parent_user.id),
+        to_user_id=int(child_user_id),
+        amount_cents=int(amount_cents),
+        note=note or "Transfer to child",
+        meta={
+            "kind": "transfer_to_child",
+            "parent_user_id": int(parent_user.id),
+            "child_user_id": int(child_user_id),
+        },
+    )
+
+
+async def transfer_from_child(
+    db: AsyncSession,
+    parent_user: User,
+    child_user_id: int,
+    amount_cents: int,
+    note: str | None = None,
+) -> list[WalletLedger]:
+    """
+    Legacy helper expected by seller_wallet (often paired with transfer_to_child).
+    Transfer from direct child -> parent with ledger + row locks.
+    """
+    if amount_cents <= 0:
+        raise WalletError("Amount must be positive.")
+
+    res = await db.execute(select(User).where(User.id == int(child_user_id)))
+    child = res.scalar_one_or_none()
+    if child is None:
+        raise WalletError("User not found.")
+
+    if child.parent_id is None or int(child.parent_id) != int(parent_user.id):
+        raise WalletError("Forbidden: can only transfer from direct children.")
+
+    return await transfer_between_users(
+        db=db,
+        from_user_id=int(child_user_id),
+        to_user_id=int(parent_user.id),
+        amount_cents=int(amount_cents),
+        note=note or "Transfer from child",
+        meta={
+            "kind": "transfer_from_child",
+            "parent_user_id": int(parent_user.id),
+            "child_user_id": int(child_user_id),
+        },
+    )
