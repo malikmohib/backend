@@ -1,3 +1,5 @@
+# app/routers/seller_wallet.py
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,7 +18,6 @@ from app.services.wallet import (
     get_balance,
     transfer_to_child,
 )
-
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
 
@@ -37,17 +38,21 @@ async def transfer_to_direct_child(
     current_user: User = Depends(get_current_user),
 ) -> TxOut:
     try:
+        # Optional: nice 404 if child doesn't exist
         res = await db.execute(select(User).where(User.id == payload.child_user_id))
         child = res.scalar_one_or_none()
         if child is None:
             raise HTTPException(status_code=404, detail="Child user not found.")
 
+        # ✅ Correct call for your service:
+        # - parent_user must be a User object (service reads parent_user.id)
+        # - child_user_id must be an int (service loads child by id)
         entries = await transfer_to_child(
-            db=db,
-            sender=current_user,
-            child_user=child,
-            amount_cents=payload.amount_cents,
-            note=payload.note,
+            db,
+            current_user,                 # parent_user (User)
+            int(payload.child_user_id),   # child_user_id (int)
+            int(payload.amount_cents),    # amount_cents
+            payload.note,                 # note
         )
 
         tx_id = str(entries[0].tx_id)
@@ -78,12 +83,14 @@ async def adjust_direct_child_balance(
         if child is None:
             raise HTTPException(status_code=404, detail="Child user not found.")
 
+        # Based on how transfer_to_child is implemented, adjust_child_balance_down
+        # is very likely the same style: (db, parent_user, child_user_id, target_balance_cents, note)
         entries = await adjust_child_balance_down(
-            db=db,
-            sender=current_user,
-            child_user=child,
-            target_balance_cents=payload.target_balance_cents,
-            note=payload.note,
+            db,
+            current_user,                      # parent_user (User)
+            int(payload.child_user_id),        # child_user_id (int)
+            int(payload.target_balance_cents), # target_balance_cents
+            payload.note,                      # note
         )
 
         tx_id = str(entries[0].tx_id)

@@ -11,7 +11,17 @@ from app.models.order import Order
 from app.models.plan import Plan
 from app.models.user import User
 from app.models.wallet import WalletAccount, WalletLedger
+from sqlalchemy import Integer, String, case, cast, desc, func, select, literal
+from sqlalchemy.types import UserDefinedType
+from sqlalchemy import literal
 
+
+class LTREE(UserDefinedType):
+    cache_ok = True
+
+    def get_col_spec(self, **kw):
+        return "LTREE"
+    
 
 # Windows may not ship IANA tz database; ZoneInfo requires tzdata pip package.
 # If tzdata is missing, we fall back to UTC so the app doesn't crash.
@@ -132,23 +142,18 @@ async def _direct_scope_user_ids(db: AsyncSession, *, current_user_id: int) -> l
 
 
 def _ltree_is_descendant_expr(user_path_col, ancestor_path: str):
-    # ltree operator: child_path <@ ancestor_path
-    return user_path_col.op("<@")(ancestor_path)
+    user_path_ltree = cast(user_path_col, LTREE())
+    ancestor_ltree = cast(literal(str(ancestor_path)), LTREE())
+    return user_path_ltree.op("<@")(ancestor_ltree)
 
 
 def _direct_child_bucket_user_id_expr(*, buyer_id_col, buyer_path_col, current_user_id: int, current_user_path: str):
-    """
-    For any buyer in current user's subtree, compute the "bucket" user_id:
-      - If buyer == current user => bucket = current user
-      - Else bucket = the direct child of current_user that is an ancestor of buyer
-        (derived from buyer.path using ltree subpath / nlevel)
+    buyer_path_ltree = cast(buyer_path_col, LTREE())
+    scope_ltree = cast(literal(str(current_user_path)), LTREE())
 
-    This supports rollups from grandchildren WITHOUT revealing them.
-    """
-    # Extract one label after current_user_path: "u<id>"
-    child_label_ltree = func.subpath(buyer_path_col, func.nlevel(current_user_path), 1)
+    child_label_ltree = func.subpath(buyer_path_ltree, func.nlevel(scope_ltree), 1)
     child_label_txt = cast(child_label_ltree, String)
-    child_id_txt = func.substr(child_label_txt, 2)  # strip leading "u"
+    child_id_txt = func.substr(child_label_txt, 2)
     child_id_int = cast(child_id_txt, Integer)
 
     return case(

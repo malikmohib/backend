@@ -39,7 +39,7 @@ async def get_order_report_json_scoped_by_path(
             Order.id.label("order_id"),
             Order.created_at.label("created_at"),
             Plan.title.label("plan_title"),
-            OrderItem.amount_cents.label("amount_cents"),
+            Order.total_paid_cents.label("amount_cents"),
             Order.currency.label("currency"),
             # Coupon code (your real column name)
             Coupon.coupon_code.label("coupon_code"),
