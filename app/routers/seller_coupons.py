@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -17,7 +17,15 @@ async def generate_coupons(
     body: SellerCouponGenerateRequest,
     db: AsyncSession = Depends(get_db),
     seller_user: User = Depends(require_seller),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    # Production guardrail: avoid huge writes / locks / slow requests
+    # Adjust max as you want (200 is usually safe; 1000 is heavy).
+    if int(body.count) > 200:
+        # keep it consistent with your API style
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="count too large (max 200)")
+
     return await seller_generate_coupons(
         db,
         plan_id=body.plan_id,
@@ -25,6 +33,8 @@ async def generate_coupons(
         seller_user_id=int(seller_user.id),
         owner_user_id=body.owner_user_id,
         notes=body.notes,
+        # Optional param: if you later implement idempotency in service
+        # idempotency_key=idempotency_key,
     )
 
 

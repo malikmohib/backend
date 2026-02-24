@@ -1,7 +1,7 @@
 # app/services/coupons.py
 from __future__ import annotations
-import hashlib
 
+import hashlib
 import secrets
 from datetime import datetime, timezone
 
@@ -14,6 +14,10 @@ from app.models.coupon import Coupon
 from app.models.coupon_event import CouponEvent
 from app.models.plan import Plan
 from app.models.user import User
+
+# ✅ NEW: paid “generate coupons” uses the purchase engine (wallet + ledger + profit share + paid order)
+from app.services.purchases import PurchaseError, purchase_plan_and_distribute
+from app.services.wallet import InsufficientBalance
 
 
 def _generate_coupon_code() -> str:
@@ -295,15 +299,27 @@ async def seller_generate_coupons(
     notes: str | None,
 ) -> list[Coupon]:
     """
-    Seller can generate coupons for:
-      - self
-      - optionally a DIRECT child (owner_user_id where parent_id == seller_user_id)
+    ✅ PRODUCTION CHANGE (PAID COUPON GENERATION):
+    Seller "generate coupons" is a REAL purchase:
+      - uses wallet balance (debit seller)
+      - posts wallet_ledger rows (purchase_debit + profit/admin credits)
+      - applies multi-level hierarchical profit sharing
+      - creates a paid order + order_items + coupons atomically
 
-    This MUST NOT allow generating for grandchildren or arbitrary users.
+    Owner rule:
+      - coupons can be owned by seller OR seller's DIRECT child only (no grandchildren).
     """
+    # Load seller
+    seller = await db.get(User, int(seller_user_id))
+    if not seller:
+        raise HTTPException(status_code=404, detail="Seller not found")
+    if seller.role != "seller":
+        raise HTTPException(status_code=403, detail="Only sellers can generate coupons")
+
     # Determine owner
     target_owner_id = int(owner_user_id) if owner_user_id is not None else int(seller_user_id)
 
+    # Enforce: self or direct child only
     if target_owner_id != int(seller_user_id):
         res = await db.execute(select(User.id, User.parent_id).where(User.id == target_owner_id))
         row = res.first()
@@ -313,15 +329,30 @@ async def seller_generate_coupons(
         if parent_id != int(seller_user_id):
             raise HTTPException(status_code=403, detail="Seller can only generate coupons for self or direct children")
 
-    # Create coupons under the target owner. created_by_user_id is always seller.
-    return await admin_generate_coupons(
-        db,
-        plan_id=plan_id,
-        count=count,
-        created_by_user_id=int(seller_user_id),
-        owner_user_id=target_owner_id,
-        notes=notes,
+    # Paid purchase flow (this function commits/rolls back internally)
+    try:
+        result = await purchase_plan_and_distribute(
+            db=db,
+            buyer=seller,
+            plan_id=int(plan_id),
+            quantity=int(count),
+            note=notes,
+            owner_user_id=target_owner_id,
+        )
+    except InsufficientBalance as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PurchaseError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    coupon_codes = result.get("coupon_codes") or []
+    if not coupon_codes:
+        raise HTTPException(status_code=500, detail="Purchase succeeded but no coupons were generated")
+
+    # Return Coupon ORM rows for those codes (matches router response_model=list[AdminCouponResponse])
+    res2 = await db.execute(
+        select(Coupon).where(Coupon.coupon_code.in_(coupon_codes)).order_by(Coupon.created_at.desc())
     )
+    return list(res2.scalars().all())
 
 
 async def seller_list_coupons(
@@ -396,6 +427,7 @@ def _direct_child_bucket_user_id_expr(
         else_=child_id_int,
     )
 
+
 async def seller_recent_coupon_events_rollup(
     db: AsyncSession,
     *,
@@ -414,7 +446,7 @@ async def seller_recent_coupon_events_rollup(
 
     # Bucket by coupon owner path (not by raw actor) to avoid leaking grandchildren.
     seller_path_nlevel = int(getattr(seller_user, "depth", 0)) + 1
-    
+
     bucket_actor_id = _direct_child_bucket_user_id_expr(
         leaf_id_col=Owner.id,
         leaf_path_col=Owner.path,

@@ -50,8 +50,7 @@ async def _get_plan(db: AsyncSession, plan_id: int) -> Plan:
 
 async def _get_admin_base_price_cents(db: AsyncSession, plan_id: int) -> int:
     res = await db.execute(
-        select(AdminPlanBasePrice.base_price_cents)
-        .where(AdminPlanBasePrice.plan_id == plan_id)
+        select(AdminPlanBasePrice.base_price_cents).where(AdminPlanBasePrice.plan_id == plan_id)
     )
     v = res.scalar_one_or_none()
     if v is None:
@@ -61,8 +60,7 @@ async def _get_admin_base_price_cents(db: AsyncSession, plan_id: int) -> int:
 
 async def _get_edge_price_cents(db: AsyncSession, parent_id: int, child_id: int, plan_id: int) -> int:
     res = await db.execute(
-        select(SellerEdgePlanPrice.price_cents)
-        .where(
+        select(SellerEdgePlanPrice.price_cents).where(
             SellerEdgePlanPrice.parent_user_id == parent_id,
             SellerEdgePlanPrice.child_user_id == child_id,
             SellerEdgePlanPrice.plan_id == plan_id,
@@ -80,6 +78,7 @@ async def purchase_plan_and_distribute(
     plan_id: int,
     quantity: int = 1,
     note: str | None = None,
+    owner_user_id: int | None = None,
 ) -> dict:
     """
     Buyer is charged using direct parent -> buyer edge price for plan.
@@ -96,8 +95,14 @@ async def purchase_plan_and_distribute(
       - quantity support
       - debit/credits scale by quantity
       - create orders + order_items linked to tx_id
-      - generate N coupons immediately (no inventory) and assign to buyer
+      - generate N coupons immediately (no inventory) and assign to owner_user_id (default buyer)
       - single commit (atomic)
+
+    Owner rules:
+      - default owner = buyer
+      - if owner_user_id is provided:
+          - only allowed when buyer is a seller
+          - owner_user_id must be buyer itself OR buyer's DIRECT child (no grandchildren)
     """
     if quantity < 1:
         raise PurchaseError("quantity must be >= 1.")
@@ -106,6 +111,20 @@ async def purchase_plan_and_distribute(
 
     if buyer.parent_id is None:
         raise PurchaseError("Buyer has no parent; cannot purchase.")
+
+    # --- Coupon owner logic (who receives the coupons) ---
+    coupon_owner_id = int(owner_user_id) if owner_user_id is not None else int(buyer.id)
+
+    if coupon_owner_id != int(buyer.id):
+        # Only seller can assign ownership to someone else
+        if buyer.role != "seller":
+            raise PurchaseError("Only seller can assign coupon ownership to another user.")
+
+        owner = await _get_user(db, coupon_owner_id)
+
+        # Must be direct child of seller (privacy rule)
+        if owner.parent_id != int(buyer.id):
+            raise PurchaseError("Seller can only assign coupons to direct children (no grandchildren).")
 
     # Unit purchase price = buyer direct parent edge price
     unit_price_cents = await _get_edge_price_cents(db, buyer.parent_id, buyer.id, plan_id)
@@ -151,9 +170,7 @@ async def purchase_plan_and_distribute(
         current_child = parent
 
     # Scale credits for quantity
-    credits_by_user_scaled: dict[int, int] = {
-        uid: int(cents) * int(quantity) for uid, cents in credits_by_user_unit.items()
-    }
+    credits_by_user_scaled: dict[int, int] = {uid: int(cents) * int(quantity) for uid, cents in credits_by_user_unit.items()}
 
     # Lock all accounts involved
     all_user_ids = [buyer.id] + list(credits_by_user_scaled.keys())
@@ -176,10 +193,7 @@ async def purchase_plan_and_distribute(
         await db.execute(
             update(WalletAccount)
             .where(WalletAccount.user_id == buyer.id)
-            .values(
-                balance_cents=buyer_acc.balance_cents - total_paid_cents,
-                updated_at=_now_utc(),
-            )
+            .values(balance_cents=buyer_acc.balance_cents - total_paid_cents, updated_at=_now_utc())
         )
 
         debit_entry = WalletLedger(
@@ -196,6 +210,7 @@ async def purchase_plan_and_distribute(
                 "unit_price_cents": unit_price_cents,
                 "quantity": quantity,
                 "total_paid_cents": total_paid_cents,
+                "coupon_owner_id": coupon_owner_id,
             },
         )
         db.add(debit_entry)
@@ -210,10 +225,7 @@ async def purchase_plan_and_distribute(
             await db.execute(
                 update(WalletAccount)
                 .where(WalletAccount.user_id == uid)
-                .values(
-                    balance_cents=acc.balance_cents + cents,
-                    updated_at=_now_utc(),
-                )
+                .values(balance_cents=acc.balance_cents + cents, updated_at=_now_utc())
             )
 
             user_obj = await _get_user(db, uid)
@@ -265,9 +277,10 @@ async def purchase_plan_and_distribute(
                 db.add(profit_entry)
 
         if total_credits != total_paid_cents:
-            raise PurchaseError(
-                f"Internal mismatch: credits({total_credits}) != purchase({total_paid_cents})."
-            )
+            raise PurchaseError(f"Internal mismatch: credits({total_credits}) != purchase({total_paid_cents}).")
+
+        # Flush ledger writes before order insert (helps if you add DB trigger later)
+        await db.flush()
 
         # Module E: create order row (same tx_id)
         order = Order(
@@ -283,7 +296,7 @@ async def purchase_plan_and_distribute(
         db.add(order)
         await db.flush()  # ensures order.id and order.order_no
 
-        # Generate coupons immediately (no inventory), assign to buyer, create items
+        # Generate coupons immediately (no inventory), assign to coupon_owner_id, create items
         coupon_codes: list[str] = []
 
         for _ in range(quantity):
@@ -292,9 +305,7 @@ async def purchase_plan_and_distribute(
             # Avoid mid-loop rollback: pre-check for collisions
             for _attempt in range(20):
                 candidate = f"Certify-{uuid4().hex[:8]}"
-                exists = await db.execute(
-                    select(Coupon.coupon_code).where(Coupon.coupon_code == candidate)
-                )
+                exists = await db.execute(select(Coupon.coupon_code).where(Coupon.coupon_code == candidate))
                 if exists.scalar_one_or_none() is None:
                     code = candidate
                     break
@@ -306,8 +317,8 @@ async def purchase_plan_and_distribute(
                 coupon_code=code,
                 plan_id=plan_id,
                 status="unused",
-                created_by_user_id=buyer.id,
-                owner_user_id=buyer.id,
+                created_by_user_id=buyer.id,        # payer/actor
+                owner_user_id=coupon_owner_id,      # coupon owner (seller or direct child)
                 notes=note,
             )
             db.add(coupon)
@@ -331,6 +342,7 @@ async def purchase_plan_and_distribute(
                         "tx_id": str(tx_id),
                         "plan_id": plan_id,
                         "quantity": quantity,
+                        "coupon_owner_id": coupon_owner_id,
                     },
                 )
             )
@@ -354,6 +366,7 @@ async def purchase_plan_and_distribute(
             "order_no": order.order_no,
             "quantity": quantity,
             "total_paid_cents": total_paid_cents,
+            "coupon_owner_user_id": coupon_owner_id,
             "coupon_codes": coupon_codes,
             "keys_text": keys_text,
         }
