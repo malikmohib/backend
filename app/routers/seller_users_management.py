@@ -11,6 +11,10 @@ from app.models.plan import Plan
 from app.models.seller_plan_price import SellerPlanPrice
 from app.models.user import User
 from app.models.wallet import WalletAccount
+
+# ✅ Correct location (you confirmed SellerEdgePlanPrice is in app/models/pricing.py)
+from app.models.pricing import SellerEdgePlanPrice
+
 from app.schemas.seller_users_management import (
     SellerCreateChildSellerRequest,
     SellerUpdateChildSellerRequest,
@@ -72,6 +76,7 @@ async def seller_list_direct_children(
     children = res.scalars().all()
 
     child_ids = [int(u.id) for u in children]
+
     # wallets
     wallets_by_uid: dict[int, WalletAccount] = {}
     if child_ids:
@@ -139,6 +144,10 @@ async def seller_create_direct_child_seller(
     - can only assign plans seller already has (seller_plan_prices)
     - child price_cents must be >= seller's own price_cents for that plan
     - no initial balance here (handled via /{child_id}/balance endpoint)
+
+    FIX:
+    - also creates seller_edge_plan_prices rows (parent -> child) for each assigned plan
+      so purchases never fail with "Edge price missing..."
     """
 
     try:
@@ -209,6 +218,21 @@ async def seller_create_direct_child_seller(
                 )
             )
 
+        # ✅ FIX: create edge prices parent -> child for the same plans/prices
+        # This is what purchase flow needs to compute profit chain safely.
+        for pp in payload.plans:
+            db.add(
+                SellerEdgePlanPrice(
+                    parent_user_id=int(seller_user.id),
+                    child_user_id=int(child.id),
+                    plan_id=int(pp.plan_id),
+                    price_cents=int(pp.price_cents),
+                    currency="USD",
+                    is_admin_override=False,
+                    updated_by_user_id=int(seller_user.id),
+                )
+            )
+
         await db.commit()
         await db.refresh(child)
 
@@ -259,6 +283,7 @@ async def seller_create_direct_child_seller(
     except Exception:
         await db.rollback()
         raise
+
 
 @router.patch("/{child_id}", response_model=SellerChildSellerOut)
 async def seller_update_direct_child_seller(
@@ -349,6 +374,27 @@ async def seller_update_direct_child_seller(
                             currency="USD",
                         )
                     )
+
+            # ✅ FIX: keep edge pricing in sync with child plan prices
+            # easiest + safest: replace all edges for this parent->child
+            await db.execute(
+                delete(SellerEdgePlanPrice).where(
+                    SellerEdgePlanPrice.parent_user_id == int(seller_user.id),
+                    SellerEdgePlanPrice.child_user_id == int(child.id),
+                )
+            )
+            for pp in payload.plans:
+                db.add(
+                    SellerEdgePlanPrice(
+                        parent_user_id=int(seller_user.id),
+                        child_user_id=int(child.id),
+                        plan_id=int(pp.plan_id),
+                        price_cents=int(pp.price_cents),
+                        currency="USD",
+                        is_admin_override=False,
+                        updated_by_user_id=int(seller_user.id),
+                    )
+                )
 
         await db.commit()
         await db.refresh(child)
