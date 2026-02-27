@@ -1,16 +1,14 @@
+# app/routers/admin_sellers.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.schemas.admin_sellers import AdminDeleteSellerIn  # you'll add this schema next
-from app.services.wallet import admin_delete_user_return_balance_to_parent, WalletError
-from app.schemas.admin_sellers import AdminDeleteSellerIn
-from app.services.wallet import admin_delete_user_return_balance_to_parent, WalletError
 
 from app.core.db import get_db
 from app.core.deps import require_admin
 from app.models.plan import Plan
+from app.models.pricing import SellerEdgePlanPrice
 from app.models.seller_plan_price import SellerPlanPrice
 from app.models.user import User
 from app.models.wallet import WalletAccount
@@ -22,16 +20,54 @@ from app.schemas.admin_sellers import (
     SellerPlanPriceOut,
     AdminUpdateSellerRequest,
     AdminSetSellerBalanceIn,
+    AdminDeleteSellerIn,
 )
 
 from app.services.tree import create_user_under_parent
 from app.services.wallet import (
     admin_set_balance_via_parent,
+    admin_delete_user_return_balance_to_parent,
     get_balance,
     WalletError,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin-sellers"])
+
+
+async def _sync_edge_prices_full_replace(
+    db: AsyncSession,
+    *,
+    parent_user_id: int,
+    child_user_id: int,
+    plan_prices: list[tuple[int, int]],  # [(plan_id, price_cents)]
+    updated_by_user_id: int,
+    currency: str = "USD",
+) -> None:
+    """
+    Ensure seller_edge_plan_prices has exactly one row per (parent, child, plan)
+    matching the child's assigned plan prices (full replace).
+    """
+    # delete all existing edges for this parent->child
+    await db.execute(
+        delete(SellerEdgePlanPrice).where(
+            SellerEdgePlanPrice.parent_user_id == int(parent_user_id),
+            SellerEdgePlanPrice.child_user_id == int(child_user_id),
+        )
+    )
+
+    # insert fresh edges
+    for plan_id, price_cents in plan_prices:
+        db.add(
+            SellerEdgePlanPrice(
+                parent_user_id=int(parent_user_id),
+                child_user_id=int(child_user_id),
+                plan_id=int(plan_id),
+                price_cents=int(price_cents),
+                currency=currency,
+                updated_by_user_id=int(updated_by_user_id),
+                # is_admin_override defaults false in DB
+            )
+        )
 
 
 @router.post("/sellers", response_model=AdminSellerOut)
@@ -43,7 +79,7 @@ async def admin_create_seller(
     if payload.role == "admin":
         raise HTTPException(status_code=400, detail="Cannot create admin users via this endpoint")
 
-    parent = admin_user  # ✅ Parent is always creator
+    parent = admin_user  # ✅ Parent is always creator (id=1 in your example)
 
     # Validate plan ids (exist + active)
     plan_ids = [int(p.plan_id) for p in payload.plans]
@@ -76,16 +112,17 @@ async def admin_create_seller(
             phone=payload.phone,
             country=payload.country,
         )
+        await db.flush()
 
         # Ensure wallet exists
-        db.add(WalletAccount(user_id=user.id, balance_cents=0, currency="USD"))
+        db.add(WalletAccount(user_id=int(user.id), balance_cents=0, currency="USD"))
         await db.flush()
 
         # Parent price rule (only if parent has a record for that plan)
         if payload.plans:
             parent_prices_res = await db.execute(
                 select(SellerPlanPrice).where(
-                    SellerPlanPrice.seller_id == parent.id,
+                    SellerPlanPrice.seller_id == int(parent.id),
                     SellerPlanPrice.plan_id.in_(plan_ids),
                 )
             )
@@ -99,15 +136,26 @@ async def admin_create_seller(
                         detail=f"Plan {pid} price_cents must be >= parent price ({parent_prices[pid]})",
                     )
 
+            # Insert child plan prices
             for pp in payload.plans:
                 db.add(
                     SellerPlanPrice(
-                        seller_id=user.id,
+                        seller_id=int(user.id),
                         plan_id=int(pp.plan_id),
                         price_cents=int(pp.price_cents),
                         currency="USD",
                     )
                 )
+
+            # ✅ CRITICAL FIX: create edge rows parent->child for the same plans
+            await _sync_edge_prices_full_replace(
+                db,
+                parent_user_id=int(parent.id),
+                child_user_id=int(user.id),
+                plan_prices=[(int(pp.plan_id), int(pp.price_cents)) for pp in payload.plans],
+                updated_by_user_id=int(admin_user.id),
+                currency="USD",
+            )
 
         await db.commit()
         await db.refresh(user)
@@ -229,7 +277,7 @@ async def admin_update_seller(
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
-    res = await db.execute(select(User).where(User.id == seller_id))
+    res = await db.execute(select(User).where(User.id == int(seller_id)))
     seller = res.scalar_one_or_none()
     if not seller:
         raise HTTPException(status_code=404, detail="Seller not found")
@@ -273,12 +321,13 @@ async def admin_update_seller(
                 if inactive:
                     raise HTTPException(status_code=400, detail=f"Inactive plan_id(s): {inactive}")
 
-            # parent price rule (only if parent has a record)
             parent_id = int(seller.parent_id) if seller.parent_id is not None else int(admin_user.id)
+
+            # parent price rule (only if parent has a record)
             if plan_ids:
                 parent_prices_res = await db.execute(
                     select(SellerPlanPrice).where(
-                        SellerPlanPrice.seller_id == parent_id,
+                        SellerPlanPrice.seller_id == int(parent_id),
                         SellerPlanPrice.plan_id.in_(plan_ids),
                     )
                 )
@@ -292,38 +341,27 @@ async def admin_update_seller(
                             detail=f"Plan {pid} price_cents must be >= parent price ({parent_prices[pid]})",
                         )
 
-            # fetch existing rows
-            existing_res = await db.execute(
-                select(SellerPlanPrice).where(SellerPlanPrice.seller_id == seller.id)
-            )
-            existing = existing_res.scalars().all()
-            existing_by_plan = {int(r.plan_id): r for r in existing}
-            incoming_by_plan = {int(p.plan_id): p for p in payload.plans}
-
-            # delete removed
-            removed = [pid for pid in existing_by_plan.keys() if pid not in incoming_by_plan]
-            if removed:
-                await db.execute(
-                    delete(SellerPlanPrice).where(
-                        SellerPlanPrice.seller_id == seller.id,
-                        SellerPlanPrice.plan_id.in_(removed),
+            # FULL replace SellerPlanPrice rows
+            await db.execute(delete(SellerPlanPrice).where(SellerPlanPrice.seller_id == int(seller.id)))
+            for pp in payload.plans:
+                db.add(
+                    SellerPlanPrice(
+                        seller_id=int(seller.id),
+                        plan_id=int(pp.plan_id),
+                        price_cents=int(pp.price_cents),
+                        currency="USD",
                     )
                 )
 
-            # update existing, insert new
-            for pid, pp in incoming_by_plan.items():
-                row = existing_by_plan.get(pid)
-                if row:
-                    row.price_cents = int(pp.price_cents)
-                else:
-                    db.add(
-                        SellerPlanPrice(
-                            seller_id=int(seller.id),
-                            plan_id=int(pid),
-                            price_cents=int(pp.price_cents),
-                            currency="USD",
-                        )
-                    )
+            # ✅ CRITICAL FIX: full replace edge rows too
+            await _sync_edge_prices_full_replace(
+                db,
+                parent_user_id=int(parent_id),
+                child_user_id=int(seller.id),
+                plan_prices=[(int(pp.plan_id), int(pp.price_cents)) for pp in payload.plans],
+                updated_by_user_id=int(admin_user.id),
+                currency="USD",
+            )
 
         await db.commit()
         await db.refresh(seller)
@@ -349,7 +387,7 @@ async def admin_update_seller(
             .select_from(User)
             .outerjoin(WalletAccount, WalletAccount.user_id == User.id)
             .outerjoin(parent_alias, parent_alias.c.id == User.parent_id)
-            .where(User.id == seller.id)
+            .where(User.id == int(seller.id))
         )
         r = (await db.execute(stmt)).one()
 
@@ -357,7 +395,7 @@ async def admin_update_seller(
         price_rows = await db.execute(
             select(SellerPlanPrice, Plan)
             .join(Plan, Plan.id == SellerPlanPrice.plan_id)
-            .where(SellerPlanPrice.seller_id == seller.id)
+            .where(SellerPlanPrice.seller_id == int(seller.id))
         )
         for spp, pl in price_rows.all():
             prices.append(
@@ -401,7 +439,7 @@ async def admin_set_seller_balance(
     admin_user: User = Depends(require_admin),
 ):
     # ensure seller exists
-    res = await db.execute(select(User).where(User.id == seller_id))
+    res = await db.execute(select(User).where(User.id == int(seller_id)))
     seller = res.scalar_one_or_none()
     if not seller:
         raise HTTPException(status_code=404, detail="Seller not found")
@@ -415,7 +453,9 @@ async def admin_set_seller_balance(
             note=payload.note,
         )
 
+        await db.commit()  # ✅ REQUIRED
         wa = await get_balance(db, int(seller_id))
+
         return {
             "ok": True,
             "seller_id": int(seller_id),
@@ -425,7 +465,11 @@ async def admin_set_seller_balance(
         }
 
     except WalletError as e:
+        await db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        await db.rollback()
+        raise
 
 
 @router.delete("/sellers/{seller_id}")
@@ -435,8 +479,7 @@ async def admin_delete_seller(
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
-    # ensure seller exists
-    res = await db.execute(select(User).where(User.id == seller_id))
+    res = await db.execute(select(User).where(User.id == int(seller_id)))
     seller = res.scalar_one_or_none()
     if not seller:
         raise HTTPException(status_code=404, detail="Seller not found")
@@ -448,34 +491,13 @@ async def admin_delete_seller(
             target_user_id=int(seller_id),
             note=payload.note,
         )
-        return {
-            "ok": True,
-            "deleted_seller_id": int(seller_id),
-            "tx_count": len(entries),
-        }
-    except WalletError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
-@router.delete("/sellers/{seller_id}")
-async def admin_delete_seller(
-    seller_id: int,
-    payload: AdminDeleteSellerIn,
-    db: AsyncSession = Depends(get_db),
-    admin_user: User = Depends(require_admin),
-):
-    try:
-        entries = await admin_delete_user_return_balance_to_parent(
-            db=db,
-            admin_user=admin_user,
-            target_user_id=int(seller_id),
-            note=payload.note,
-        )
-
-        return {
-            "ok": True,
-            "seller_id": int(seller_id),
-            "tx_count": len(entries),
-        }
+        await db.commit()  # ✅ REQUIRED
+        return {"ok": True, "deleted_seller_id": int(seller_id), "tx_count": len(entries)}
 
     except WalletError as e:
+        await db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        await db.rollback()
+        raise

@@ -11,6 +11,10 @@ from app.models.plan import Plan
 from app.models.seller_plan_price import SellerPlanPrice
 from app.models.user import User
 from app.models.wallet import WalletAccount
+
+# ✅ ADD THIS IMPORT (adjust path to match your project)
+from app.models.pricing import SellerEdgePlanPrice
+
 from app.schemas.seller_users_management import (
     SellerChildSellerListResponse,
     SellerChildSellerOut,
@@ -135,6 +139,7 @@ async def seller_create_direct_child(
     Role is ALWAYS seller (no role in payload).
     Can assign plans, but only those seller already has.
     Child price must be >= seller price.
+    ✅ ALSO creates seller_edge_plan_prices rows for (parent=current_seller -> child).
     """
 
     try:
@@ -182,6 +187,7 @@ async def seller_create_direct_child(
             if not_owned:
                 raise HTTPException(status_code=400, detail=f"Forbidden plan_id(s): {not_owned}")
 
+            # enforce child >= seller for each plan
             for pp in payload.plans:
                 pid = int(pp.plan_id)
                 seller_price = int(seller_prices[pid])
@@ -191,13 +197,26 @@ async def seller_create_direct_child(
                         detail=f"Plan {pid} price_cents must be >= your price ({seller_price})",
                     )
 
-            # insert child plan prices
+            # insert child plan prices + edge prices (parent=current_seller -> child)
             for pp in payload.plans:
+                pid = int(pp.plan_id)
+                price_cents = int(pp.price_cents)
+
                 db.add(
                     SellerPlanPrice(
                         seller_id=int(child.id),
-                        plan_id=int(pp.plan_id),
-                        price_cents=int(pp.price_cents),
+                        plan_id=pid,
+                        price_cents=price_cents,
+                        currency="USD",
+                    )
+                )
+
+                db.add(
+                    SellerEdgePlanPrice(
+                        parent_user_id=int(current_seller.id),
+                        child_user_id=int(child.id),
+                        plan_id=pid,
+                        price_cents=price_cents,
                         currency="USD",
                     )
                 )
@@ -311,14 +330,38 @@ async def seller_update_direct_child(
                             detail=f"Plan {pid} price_cents must be >= your price ({seller_price})",
                         )
 
-            # delete all existing then insert (simpler + safe here)
+            # ✅ FULL REPLACE:
+            # 1) delete child seller_plan_prices
             await db.execute(delete(SellerPlanPrice).where(SellerPlanPrice.seller_id == int(child.id)))
+
+            # 2) delete parent->child edge prices (this is the missing part!)
+            await db.execute(
+                delete(SellerEdgePlanPrice).where(
+                    SellerEdgePlanPrice.parent_user_id == int(current_seller.id),
+                    SellerEdgePlanPrice.child_user_id == int(child.id),
+                )
+            )
+
+            # 3) insert new plan prices + edge prices
             for pp in payload.plans:
+                pid = int(pp.plan_id)
+                price_cents = int(pp.price_cents)
+
                 db.add(
                     SellerPlanPrice(
                         seller_id=int(child.id),
-                        plan_id=int(pp.plan_id),
-                        price_cents=int(pp.price_cents),
+                        plan_id=pid,
+                        price_cents=price_cents,
+                        currency="USD",
+                    )
+                )
+
+                db.add(
+                    SellerEdgePlanPrice(
+                        parent_user_id=int(current_seller.id),
+                        child_user_id=int(child.id),
+                        plan_id=pid,
+                        price_cents=price_cents,
                         currency="USD",
                     )
                 )

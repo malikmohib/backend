@@ -4,7 +4,8 @@ from __future__ import annotations
 from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
-
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import relationship
 from app.core.db import Base
 
 
@@ -33,3 +34,10 @@ class Plan(Base):
 
     # optional relationship
     coupons = relationship("Coupon", back_populates="plan", lazy="selectin")
+
+    coupon_category_id = Column(
+    Integer,
+    ForeignKey("coupon_categories.id", ondelete="RESTRICT"),
+    nullable=True,
+)
+coupon_category = relationship("CouponCategory")

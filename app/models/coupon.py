@@ -1,5 +1,7 @@
 # app/models/coupon.py
 from __future__ import annotations
+from sqlalchemy import JSON, ForeignKey, Integer
+from sqlalchemy.orm import relationship
 
 from sqlalchemy import (
     BigInteger,
@@ -59,3 +61,13 @@ class Coupon(Base):
     used_udid_suffix = Column(Text, nullable=True)
 
     plan = relationship("Plan", back_populates="coupons", lazy="selectin")
+
+    coupon_category_id = Column(
+    Integer,
+    ForeignKey("coupon_categories.id", ondelete="RESTRICT"),
+    nullable=True,
+)
+
+coupon_category_snapshot = Column(JSON, nullable=False, default=dict)
+
+coupon_category = relationship("CouponCategory")

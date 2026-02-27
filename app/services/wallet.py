@@ -610,85 +610,130 @@ async def seller_delete_user_return_balance_to_parent(
     note: str | None,
 ) -> list[WalletLedger]:
     """
-    Seller deletes a direct child user.
-    If child balance > 0: move it to seller FIRST (ledger while child exists), THEN delete.
+    Seller "deletes" a direct child user.
+
+    New behavior (SAFE for finance + matches your requirement):
+    - If target has children OR orders: deactivate target + all descendants (subtree)
+    - Return ALL balances from subtree users to the seller (owner) with ledger entries
+    - Never hard-delete users (avoids FK violations with orders / ledger)
 
     Permission:
     - seller_user.role must be 'seller'
-    - target_user.parent_id must equal seller_user.id
+    - target_user.parent_id must equal seller_user.id (direct child)
     """
     if seller_user.role != "seller":
         raise WalletError("Only seller can delete users here.")
 
+    # Load target user
     res = await db.execute(select(User).where(User.id == int(target_user_id)))
     target_user = res.scalar_one_or_none()
     if target_user is None:
         raise WalletError("User not found.")
 
+    # Must be direct child
     if target_user.parent_id is None or int(target_user.parent_id) != int(seller_user.id):
         raise WalletError("Forbidden: can only delete direct children.")
 
-    parent_id = int(seller_user.id)
+    owner_id = int(seller_user.id)
+
+    # --- 1) Compute subtree user ids (target + descendants) ---
+    # Using ltree: descendants have path that is contained by target_user.path
+    # (child.path is descendant of target.path)
+    # Note: in ltree, "descendant <@ ancestor" is true.
+    subtree_res = await db.execute(
+        select(User.id).where(User.path.op("<@")(target_user.path))
+    )
+    subtree_ids = [int(r[0]) for r in subtree_res.all()]
+
+    # Safety: ensure target included
+    if int(target_user.id) not in subtree_ids:
+        subtree_ids.append(int(target_user.id))
+
+    # --- 2) Lock all wallets involved (subtree + owner) ---
+    accounts = await _lock_accounts(db, [owner_id, *subtree_ids])
+    owner_acc = accounts[owner_id]
+
     tx_id = uuid4()
-
-    accounts = await _lock_accounts(db, [int(target_user.id), parent_id])
-    child_acc = accounts[int(target_user.id)]
-    parent_acc = accounts[parent_id]
-
-    child_balance = int(child_acc.balance_cents)
     entries: list[WalletLedger] = []
 
-    if child_balance > 0:
-        parent_new = int(parent_acc.balance_cents) + child_balance
+    # --- 3) Move balances from each subtree user -> owner ---
+    # Use transfer_out/transfer_in so tx_id sums to 0.
+    for uid in subtree_ids:
+        if uid == owner_id:
+            continue
 
+        acc = accounts.get(uid)
+        if not acc:
+            continue
+
+        bal = int(acc.balance_cents)
+        if bal <= 0:
+            continue
+
+        # update balances
+        owner_new = int(owner_acc.balance_cents) + bal
         await db.execute(
             update(WalletAccount)
-            .where(WalletAccount.user_id == parent_id)
-            .values(balance_cents=parent_new, updated_at=_now_utc())
+            .where(WalletAccount.user_id == owner_id)
+            .values(balance_cents=owner_new, updated_at=_now_utc())
         )
         await db.execute(
             update(WalletAccount)
-            .where(WalletAccount.user_id == int(target_user.id))
+            .where(WalletAccount.user_id == uid)
             .values(balance_cents=0, updated_at=_now_utc())
         )
 
+        # keep local object in sync for subsequent iterations
+        owner_acc.balance_cents = owner_new
+        acc.balance_cents = 0
+
         out_entry = WalletLedger(
             tx_id=tx_id,
-            user_id=int(target_user.id),
+            user_id=uid,
             entry_kind="transfer_out",
-            amount_cents=-child_balance,
+            amount_cents=-bal,
             currency=USD,
-            related_user_id=parent_id,
-            note=note or "Return balance to parent (delete user)",
+            related_user_id=owner_id,
+            note=note or "Deactivate subtree: return balance to owner",
             meta={
-                "kind": "delete_return_balance",
-                "deleted_user_id": int(target_user.id),
-                "to_user_id": parent_id,
-                "by_seller_user_id": int(seller_user.id),
+                "kind": "seller_deactivate_subtree_return_balance",
+                "root_deleted_user_id": int(target_user.id),
+                "from_user_id": uid,
+                "to_owner_user_id": owner_id,
+                "by_seller_user_id": owner_id,
             },
         )
         in_entry = WalletLedger(
             tx_id=tx_id,
-            user_id=parent_id,
+            user_id=owner_id,
             entry_kind="transfer_in",
-            amount_cents=child_balance,
+            amount_cents=bal,
             currency=USD,
-            related_user_id=int(target_user.id),
-            note=note or "Return balance to parent (delete user)",
+            related_user_id=uid,
+            note=note or "Deactivate subtree: receive balance from user",
             meta={
-                "kind": "delete_return_balance",
-                "deleted_user_id": int(target_user.id),
-                "to_user_id": parent_id,
-                "by_seller_user_id": int(seller_user.id),
+                "kind": "seller_deactivate_subtree_return_balance",
+                "root_deleted_user_id": int(target_user.id),
+                "from_user_id": uid,
+                "to_owner_user_id": owner_id,
+                "by_seller_user_id": owner_id,
             },
         )
         db.add(out_entry)
         db.add(in_entry)
         await db.flush()
+
         entries.extend([out_entry, in_entry])
 
-    await db.execute(delete(WalletAccount).where(WalletAccount.user_id == int(target_user.id)))
-    await db.execute(delete(User).where(User.id == int(target_user.id)))
+    # --- 4) Deactivate all subtree users (including target) ---
+    await db.execute(
+    update(User)
+    .where(User.id.in_(subtree_ids))
+    .values(is_active=False)
+   )
+
+    # NOTE: We do NOT delete users or wallet_accounts to avoid FK violations
+    # with orders and to preserve audit history.
 
     return entries
 

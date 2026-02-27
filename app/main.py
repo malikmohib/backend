@@ -61,6 +61,7 @@ from app.routers.seller_users_management import router as seller_users_managemen
 from app.routers.seller_balance_history import router as seller_balance_history_router
 from app.routers.seller_balance_history_rollup import router as seller_balance_history_rollup_router
 from app.routers.admin_balance_history import router as admin_balance_history_router
+from app.routers import admin_coupon_categories, bot_coupons
 
 app = FastAPI()
 
@@ -138,3 +139,6 @@ app.include_router(auth_change_password_router)
 app.include_router(seller_balance_history_router)
 app.include_router(seller_balance_history_rollup_router)
 app.include_router(admin_balance_history_router)
+
+app.include_router(admin_coupon_categories.router)
+app.include_router(bot_coupons.router)

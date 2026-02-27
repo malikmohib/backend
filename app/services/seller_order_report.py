@@ -76,19 +76,6 @@ async def get_seller_order_report_json_scoped_by_path(
         .join(Plan, Plan.id == Order.plan_id)
         .outerjoin(OrderItem, OrderItem.order_id == Order.id)
         .where(User.path.op("<@")(scope_path))
-        .order_by(Order.created_at.desc(), Order.id.desc())
-        .group_by(
-            order_no_col,
-            Order.created_at,
-            Order.plan_id,
-            Plan.title,
-            Plan.category,
-            Order.quantity,
-            Order.total_paid_cents,
-            Order.currency,
-        )
-        .limit(int(limit))
-        .offset(int(offset))
     )
 
     # date_from/date_to are DATE, but created_at is datetime => compare by date()
@@ -98,6 +85,14 @@ async def get_seller_order_report_json_scoped_by_path(
         q = q.where(func.date(Order.created_at) <= date_to)
     if currency:
         q = q.where(Order.currency == currency)
+
+    # ✅ FIX: group by primary keys (required for aggregates + ORDER BY)
+    q = (
+        q.group_by(Order.id, Plan.id)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+        .limit(int(limit))
+        .offset(int(offset))
+    )
 
     res = await db.execute(q)
     rows = res.mappings().all()
@@ -110,7 +105,6 @@ async def get_seller_order_report_json_scoped_by_path(
         total_amount_cents += total_paid
 
         coupon_codes = r["coupon_codes"] or []
-        # Some PG drivers return array_agg as list already; keep it safe:
         if isinstance(coupon_codes, (list, tuple)):
             coupon_codes_list = [str(x) for x in coupon_codes if x]
         else:
@@ -132,7 +126,6 @@ async def get_seller_order_report_json_scoped_by_path(
                 "total_paid_cents": total_paid,
                 "currency": r["currency"] or "USD",
 
-                # ✅ now filled
                 "coupon_codes": coupon_codes_list,
                 "serials": [],  # keep for frontend compatibility
                 "keys_text": keys_text,
